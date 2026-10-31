@@ -55,6 +55,9 @@ pub struct Beacon {
     /// Platform (ör. "windows-x86_64"); güncelleme yalnızca aynı platforma verilir
     #[serde(default)]
     pub plat: String,
+    /// Ağ kartlarının MAC adresleri (bilgisayar kapalıyken uzaktan uyandırmak için)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macs: Vec<String>,
 }
 
 /// Bu programın sürümü.
@@ -95,6 +98,7 @@ impl Beacon {
             port,
             ver: APP_VERSION.into(),
             plat: platform(),
+            macs: Vec::new(),
         }
     }
 

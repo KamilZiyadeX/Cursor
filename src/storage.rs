@@ -212,6 +212,9 @@ pub struct KnownPeer {
     pub id: String,
     pub name: String,
     pub addr: Option<SocketAddr>,
+    /// Uzaktan uyandırma için ağ kartı adresleri
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macs: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -940,6 +943,7 @@ mod tests {
                 id: "p".into(),
                 name: "Ofis".into(),
                 addr: Some("192.168.1.5:47821".parse().unwrap()),
+                macs: vec!["aa:bb:cc:dd:ee:ff".into()],
             }],
             messages: vec![
                 ChatMessage {
@@ -974,6 +978,7 @@ mod tests {
         h.save(&dir).unwrap();
         let loaded = History::load(&dir);
         assert_eq!(loaded.peers[0].name, "Ofis");
+        assert_eq!(loaded.peers[0].macs, ["aa:bb:cc:dd:ee:ff"]);
         // Bizim yarım kalan gönderimimiz sıraya döner, gelen yarım aktarım başarısız sayılır
         assert_eq!(loaded.messages[0].state, MsgState::Queued);
         assert!(matches!(loaded.messages[1].state, MsgState::Failed(_)));

@@ -37,6 +37,8 @@ struct Peer {
     last_seen: Option<Instant>,
     /// Aynı bilgisayardaki (bu Windows kullanıcısının) başka bir hesap
     local: bool,
+    /// Uzaktan uyandırma için ağ kartı adresleri
+    macs: Vec<String>,
 }
 
 /// Bizim başlattığımız eşleştirme
@@ -271,6 +273,7 @@ impl LanChatApp {
                 addr: p.addr,
                 last_seen: None,
                 local: false,
+                macs: p.macs,
             })
             .collect();
         let selected = history.messages.last().map(|m| m.peer_id.clone());
@@ -366,6 +369,7 @@ impl LanChatApp {
                     addr: Some(addr),
                     last_seen: Some(Instant::now()),
                     local: local.unwrap_or(false),
+                    macs: Vec::new(),
                 });
                 if self.selected.is_none() {
                     self.selected = Some(id.to_string());
@@ -553,7 +557,15 @@ impl LanChatApp {
                 id,
                 version,
                 platform,
+                macs,
             } => {
+                if let Some(p) = self.peer_mut(&id)
+                    && !macs.is_empty()
+                    && p.macs != macs
+                {
+                    p.macs = macs;
+                    self.dirty = true;
+                }
                 self.peer_versions.insert(id, (version, platform));
             }
             NetEvent::UpdateProgress { done, total } => {
@@ -807,6 +819,7 @@ impl LanChatApp {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     addr: p.addr,
+                    macs: p.macs.clone(),
                 })
                 .collect(),
             messages: self.messages.clone(),
@@ -1169,6 +1182,18 @@ impl LanChatApp {
                 }
                 Err(e) => self.show_toast(format!("Resim kaydedilemedi: {e}")),
             }
+        }
+    }
+
+    /// Kapalı bilgisayarı Wake-on-LAN ile uyandırmayı dener.
+    fn wake_peer(&mut self, peer_id: &str) {
+        let Some(p) = self.peer(peer_id) else { return };
+        match net::wake_on_lan(&p.macs, p.addr.map(|a| a.ip())) {
+            Ok(_) => self.show_toast(format!(
+                "“{}” için uyandırma sinyali gönderildi. Bilgisayarın açılması bir iki dakika sürebilir.",
+                p.name
+            )),
+            Err(e) => self.show_toast(format!("Uyandırma sinyali gönderilemedi: {e}")),
         }
     }
 
@@ -2396,6 +2421,8 @@ impl LanChatApp {
         let mut pair_clicked = false;
         let mut toggle_search = false;
         let mut export_clicked = false;
+        let mut wake_clicked = false;
+        let macs_known = self.peer(&peer_id).is_some_and(|p| !p.macs.is_empty());
         egui::Panel::top("chat-header").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2439,6 +2466,22 @@ impl LanChatApp {
                     ("çevrimdışı", Color32::GRAY)
                 };
                 ui.label(RichText::new(txt).color(col).small());
+                if !online && paired && !local {
+                    let b = ui
+                        .add_enabled(macs_known, egui::Button::new("⏰ Uyandır").small())
+                        .on_hover_text(
+                            "Kapalı ya da uykudaki bilgisayarı ağ üzerinden açmayı dener \
+                             (Wake-on-LAN). Bilgisayarın BIOS'unda ve ağ kartı ayarlarında \
+                             açık olmalıdır; genellikle kablolu bağlantıda çalışır.",
+                        )
+                        .on_disabled_hover_text(
+                            "Bu bilgisayarın ağ kartı adresi henüz bilinmiyor. LanChat'in yeni \
+                             sürümüyle bir kez çevrimiçi olunca öğrenilir.",
+                        );
+                    if b.clicked() {
+                        wake_clicked = true;
+                    }
+                }
                 if self
                     .typing
                     .get(&peer_id)
@@ -2503,6 +2546,9 @@ impl LanChatApp {
             }
             ui.add_space(4.0);
         });
+        if wake_clicked {
+            self.wake_peer(&peer_id);
+        }
         if export_clicked {
             self.export_chat(&peer_id, &name);
         }

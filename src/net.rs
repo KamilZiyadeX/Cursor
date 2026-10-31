@@ -83,6 +83,8 @@ pub enum NetEvent {
         id: String,
         version: String,
         platform: String,
+        /// Uzaktan uyandırma için MAC adresleri
+        macs: Vec<String>,
     },
     UpdateProgress {
         done: u64,
@@ -281,6 +283,8 @@ struct Inner {
     tx: Sender<NetEvent>,
     notify: Box<dyn Fn() + Send + Sync>,
     my_id: String,
+    /// Bu bilgisayarın MAC adresleri (duyurularda paylaşılır)
+    macs: Vec<String>,
     name: RwLock<String>,
     download_dir: RwLock<PathBuf>,
     tcp_port: u16,
@@ -363,6 +367,7 @@ impl Net {
                 tx,
                 notify: Box::new(notify),
                 my_id: opts.my_id,
+                macs: local_macs(),
                 name: RwLock::new(opts.name),
                 download_dir: RwLock::new(opts.download_dir),
                 tcp_port,
@@ -622,11 +627,12 @@ impl Net {
 
     fn discovery_send_loop(&self, sock: UdpSocket) {
         loop {
-            let beacon = Beacon::new(
+            let mut beacon = Beacon::new(
                 &self.inner.my_id,
                 &self.inner.name.read().unwrap(),
                 self.inner.tcp_port,
             );
+            beacon.macs = self.inner.macs.clone();
             if let Ok(data) = serde_json::to_vec(&beacon) {
                 let mut targets: HashSet<IpAddr> = broadcast_addresses().into_iter().collect();
                 targets.insert(IpAddr::V4(Ipv4Addr::BROADCAST));
@@ -661,6 +667,7 @@ impl Net {
                     id: b.id.clone(),
                     version: b.ver.clone(),
                     platform: b.plat.clone(),
+                    macs: b.macs.clone(),
                 });
             }
             self.emit(NetEvent::PeerSeen {
@@ -1666,6 +1673,84 @@ fn bind_discovery(port: u16) -> io::Result<UdpSocket> {
     Ok(s.into())
 }
 
+/// Bu bilgisayarın ağ kartlarının (IPv4 adresi olanların) MAC adresleri.
+pub fn local_macs() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for i in if_addrs::get_if_addrs().unwrap_or_default() {
+        if i.is_loopback() || !matches!(i.ip(), IpAddr::V4(_)) {
+            continue;
+        }
+        if let Ok(Some(m)) = mac_address::mac_address_by_name(&i.name) {
+            let b = m.bytes();
+            let s = format_mac(b);
+            if b != [0; 6] && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out.truncate(6);
+    out
+}
+
+fn format_mac(b: [u8; 6]) -> String {
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// "aa:bb:cc:dd:ee:ff" ya da "AA-BB-CC-DD-EE-FF" biçimindeki MAC adresini çözer.
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split([':', '-']).collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (o, p) in out.iter_mut().zip(parts) {
+        if p.len() != 2 {
+            return None;
+        }
+        *o = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Wake-on-LAN "sihirli paketi": 6 × FF ve ardından 16 kez MAC adresi.
+pub fn magic_packet(mac: [u8; 6]) -> [u8; 102] {
+    let mut p = [0xFFu8; 102];
+    for i in 0..16 {
+        p[6 + i * 6..12 + i * 6].copy_from_slice(&mac);
+    }
+    p
+}
+
+/// Kapalı (uykudaki) bilgisayarı uyandırmak için sihirli paketi ağın her yerine
+/// yayınlar. Gönderilen paket sayısını döndürür.
+pub fn wake_on_lan(macs: &[String], last_ip: Option<IpAddr>) -> io::Result<usize> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    sock.set_broadcast(true)?;
+    let mut targets: HashSet<IpAddr> = broadcast_addresses().into_iter().collect();
+    targets.insert(IpAddr::V4(Ipv4Addr::BROADCAST));
+    if let Some(ip) = last_ip {
+        targets.insert(ip);
+    }
+    let mut sent = 0;
+    for mac in macs.iter().filter_map(|m| parse_mac(m)) {
+        let packet = magic_packet(mac);
+        for ip in &targets {
+            for port in [9, 7] {
+                if sock.send_to(&packet, SocketAddr::new(*ip, port)).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+    }
+    if sent == 0 {
+        return Err(io::Error::other("Uyandırma sinyali gönderilemedi"));
+    }
+    Ok(sent)
+}
+
 /// Her ağ arayüzünün yayın (broadcast) adresi.
 fn broadcast_addresses() -> Vec<IpAddr> {
     let mut out = Vec::new();
@@ -2188,6 +2273,28 @@ mod tests {
         };
         assert!(!unreachable);
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn wake_on_lan_packet() {
+        assert_eq!(
+            parse_mac("AA-bb-0c-dd-ee-0F"),
+            Some([0xaa, 0xbb, 0x0c, 0xdd, 0xee, 0x0f])
+        );
+        assert_eq!(parse_mac("aa:bb:cc"), None);
+        assert_eq!(parse_mac("zz:bb:cc:dd:ee:ff"), None);
+        let mac = [1, 2, 3, 4, 5, 6];
+        let p = magic_packet(mac);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert!(p[6..].chunks(6).all(|c| c == mac));
+        assert_eq!(format_mac(mac), "01:02:03:04:05:06");
+
+        // Yerel ağa gönderilebiliyor ve yerel MAC adresleri okunabiliyor
+        let n = wake_on_lan(&["01:02:03:04:05:06".into()], Some([127, 0, 0, 1].into())).unwrap();
+        assert!(n >= 2);
+        for m in local_macs() {
+            assert!(parse_mac(&m).is_some(), "{m}");
+        }
     }
 
     #[test]
