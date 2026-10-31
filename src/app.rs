@@ -72,6 +72,27 @@ enum PasswordAction {
     Remove { current: String },
 }
 
+enum Thumb {
+    Loading,
+    Ready(egui::TextureHandle),
+    Failed,
+}
+
+/// Önizleme gösterilecek resim dosyası mı?
+fn is_image(name: &str) -> bool {
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
+}
+
+/// Önizleme için en fazla bu kadar büyük dosyalar çözülür.
+const THUMB_MAX_FILE: u64 = 64 * 1024 * 1024;
+
 struct Settings {
     has_password: bool,
     pw_current: String,
@@ -102,6 +123,10 @@ pub struct LanChatApp {
     last_typing_sent: Option<Instant>,
     /// Yanıtlanan mesaj (hangi sohbette, alıntı)
     replying: Option<(String, ReplyRef)>,
+    /// Resim önizlemeleri (mesaj kimliğine göre)
+    thumbs: HashMap<String, Thumb>,
+    thumb_tx: Sender<(String, Option<egui::ColorImage>)>,
+    thumb_rx: Receiver<(String, Option<egui::ColorImage>)>,
     out_pair: Option<OutPair>,
     in_pair: Option<InPair>,
     net: Option<Net>,
@@ -131,6 +156,7 @@ impl LanChatApp {
 
         let local_registry = Some(storage::online_dir(&root_dir));
         let logo = small_logo_texture(ctx);
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         let tcp_port = std::env::var("LANCHAT_PORT")
             .ok()
@@ -178,6 +204,9 @@ impl LanChatApp {
             typing: HashMap::new(),
             last_typing_sent: None,
             replying: None,
+            thumbs: HashMap::new(),
+            thumb_tx,
+            thumb_rx,
             out_pair: None,
             in_pair: None,
             net,
@@ -570,6 +599,57 @@ impl LanChatApp {
             self.show_toast(
                 "Mesaj sizden silindi; karşı taraf çevrimiçi olmadığı için onda kalabilir",
             );
+        }
+    }
+
+    /// Görünen resim mesajlarının önizlemesini arka planda hazırlar.
+    fn request_thumbs(&mut self, ctx: &egui::Context, ids: Vec<String>) {
+        for id in ids {
+            if self.thumbs.contains_key(&id) {
+                continue;
+            }
+            let Some(Body::File {
+                path: Some(path), ..
+            }) = self.messages.iter().find(|m| m.id == id).map(|m| &m.body)
+            else {
+                continue;
+            };
+            if std::fs::metadata(path).map_or(true, |m| m.len() > THUMB_MAX_FILE) {
+                self.thumbs.insert(id, Thumb::Failed);
+                continue;
+            }
+            // Bellek sınırı: çok fazla önizleme biriktiyse eskileri at
+            if self.thumbs.len() > 300 {
+                self.thumbs.clear();
+            }
+            self.thumbs.insert(id.clone(), Thumb::Loading);
+            let (path, tx, ctx) = (path.clone(), self.thumb_tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let img = image::open(&path).ok().map(|img| {
+                    // Yüksek çözünürlüklü ekranlar için gösterim boyutunun iki katı
+                    let t = img.thumbnail(560, 440).to_rgba8();
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [t.width() as usize, t.height() as usize],
+                        t.as_raw(),
+                    )
+                });
+                let _ = tx.send((id, img));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn receive_thumbs(&mut self, ctx: &egui::Context) {
+        while let Ok((id, img)) = self.thumb_rx.try_recv() {
+            let t = match img {
+                Some(img) => Thumb::Ready(ctx.load_texture(
+                    format!("thumb-{id}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                )),
+                None => Thumb::Failed,
+            };
+            self.thumbs.insert(id, t);
         }
     }
 
@@ -1411,6 +1491,7 @@ impl LanChatApp {
         }
 
         let mut actions: Vec<Action> = Vec::new();
+        let mut wanted_thumbs: Vec<String> = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
             ScrollArea::vertical()
                 .stick_to_bottom(true)
@@ -1436,15 +1517,36 @@ impl LanChatApp {
                             last_day = day;
                         }
                         let status = is_broadcast.then(|| self.broadcast_status(m));
-                        message_bubble(ui, m, status, &mut actions);
+                        let thumb = match self.thumbs.get(&m.id) {
+                            Some(Thumb::Ready(t)) => Some(t),
+                            _ => None,
+                        };
+                        if let Body::File { name, path: Some(_), is_dir: false, .. } = &m.body
+                            && m.state == MsgState::Done
+                            && !m.deleted
+                            && is_image(name)
+                            && !self.thumbs.contains_key(&m.id)
+                            && ui.is_rect_visible(egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(10.0, 300.0),
+                            ))
+                        {
+                            wanted_thumbs.push(m.id.clone());
+                        }
+                        message_bubble(ui, m, status, thumb, &mut actions);
                         ui.add_space(4.0);
                     }
                     ui.add_space(4.0);
                 });
         });
 
+        if !wanted_thumbs.is_empty() {
+            let ctx = ui.ctx().clone();
+            self.request_thumbs(&ctx, wanted_thumbs);
+        }
         for a in actions {
             match a {
+                Action::OpenFile(p) => open_path(&p),
                 Action::Retry(id) => self.retry(&id),
                 Action::Cancel(id) => {
                     if let Some(net) = &self.net {
@@ -1740,6 +1842,7 @@ impl LanChatApp {
 }
 
 enum Action {
+    OpenFile(PathBuf),
     Retry(String),
     Cancel(String),
     Copy(String),
@@ -1761,6 +1864,7 @@ fn message_bubble(
     ui: &mut egui::Ui,
     m: &ChatMessage,
     status: Option<String>,
+    thumb: Option<&egui::TextureHandle>,
     actions: &mut Vec<Action>,
 ) {
     let dark = ui.visuals().dark_mode;
@@ -1824,7 +1928,7 @@ fn message_bubble(
                         Body::Text(t) => {
                             ui.add(egui::Label::new(RichText::new(t).size(15.0)).wrap());
                         }
-                        Body::File { .. } => file_body(ui, m, actions),
+                        Body::File { .. } => file_body(ui, m, thumb, actions),
                     }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format_time(m.ts)).small().weak());
@@ -1937,7 +2041,12 @@ fn message_bubble(
     });
 }
 
-fn file_body(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>) {
+fn file_body(
+    ui: &mut egui::Ui,
+    m: &ChatMessage,
+    thumb: Option<&egui::TextureHandle>,
+    actions: &mut Vec<Action>,
+) {
     let Body::File {
         name,
         size,
@@ -1949,6 +2058,21 @@ fn file_body(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>) {
         return;
     };
     let (size, is_dir) = (*size, *is_dir);
+    if let (Some(tex), Some(p)) = (thumb, path) {
+        let resp = ui
+            .add(
+                egui::Image::new(tex)
+                    .max_size(egui::vec2(280.0, 220.0))
+                    .corner_radius(8)
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Açmak için tıklayın");
+        if resp.clicked() {
+            actions.push(Action::OpenFile(p.clone()));
+        }
+        ui.add_space(2.0);
+    }
     let scanning =
         is_dir && m.outgoing && size == 0 && *file_count == 0 && m.state == MsgState::Pending;
 
@@ -2059,6 +2183,7 @@ impl eframe::App for LanChatApp {
         }
 
         self.send_read_receipts();
+        self.receive_thumbs(ctx);
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             self.save_history();
         }
@@ -2296,6 +2421,25 @@ fn reveal_path(p: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_detection_and_thumbnail_size() {
+        assert!(is_image("Tatil.JPG"));
+        assert!(is_image("ekran.png"));
+        assert!(!is_image("rapor.pdf"));
+        assert!(!is_image("png"));
+
+        // Büyük bir resim, oranı korunarak en fazla 560x440'a küçültülür
+        let dir = std::env::temp_dir().join(format!("lanchat-thumb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("buyuk.png");
+        image::RgbaImage::from_pixel(2000, 1000, image::Rgba([200, 30, 30, 255]))
+            .save(&path)
+            .unwrap();
+        let t = image::open(&path).unwrap().thumbnail(560, 440);
+        assert_eq!((t.width(), t.height()), (560, 280));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn counts_and_eta() {
