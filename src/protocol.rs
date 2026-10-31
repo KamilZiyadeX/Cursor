@@ -125,6 +125,18 @@ pub enum Packet {
     },
     /// Gönderenin daha önce yolladığı bir mesajı iki taraftan da siler
     Delete { from: From, msg_id: String },
+    /// Gönderenin daha önce yolladığı metin mesajını düzeltir
+    Edit {
+        from: From,
+        msg_id: String,
+        text: String,
+    },
+    /// Bir mesaja tepki (👍 gibi); `emoji` yoksa gönderenin tepkisi kaldırılır
+    React {
+        from: From,
+        msg_id: String,
+        emoji: Option<String>,
+    },
     /// Karşı tarafın programını (güncelleme olarak) ister
     GetUpdate { from: From },
     /// Eşleştirme isteği; alıcıda iki tarafın anahtarlarından türetilen kod gösterilir.

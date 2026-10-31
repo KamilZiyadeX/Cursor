@@ -13,7 +13,8 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
     RichText, ScrollArea, Stroke, TextEdit,
 };
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -140,6 +141,8 @@ pub struct LanChatApp {
     last_typing_sent: Option<Instant>,
     /// Yanıtlanan mesaj (hangi sohbette, alıntı)
     replying: Option<(String, ReplyRef)>,
+    /// Düzenlenen mesaj (hangi sohbette, mesaj kimliği)
+    editing: Option<(String, String)>,
     /// Açık arama: (hangi sohbette, aranan metin)
     search: Option<(String, String)>,
     /// Arama kutusuna odaklanılsın mı (bir kerelik)
@@ -264,6 +267,7 @@ impl LanChatApp {
             typing: HashMap::new(),
             last_typing_sent: None,
             replying: None,
+            editing: None,
             search: None,
             search_focus: false,
             thumbs: HashMap::new(),
@@ -545,6 +549,40 @@ impl LanChatApp {
                     self.dirty = true;
                 }
             }
+            NetEvent::Edited {
+                peer_id,
+                msg_id,
+                text,
+            } => {
+                // Yalnızca o kişinin bize gönderdiği metin mesajı düzeltilebilir
+                if let Some(m) = self
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == msg_id && m.peer_id == peer_id && !m.outgoing && !m.deleted)
+                    && matches!(m.body, Body::Text(_))
+                {
+                    m.body = Body::Text(text);
+                    m.edited = true;
+                    self.dirty = true;
+                }
+            }
+            NetEvent::Reacted {
+                peer_id,
+                msg_id,
+                emoji,
+            } => {
+                if let Some(m) = self
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == msg_id && m.peer_id == peer_id && !m.deleted)
+                {
+                    match emoji {
+                        Some(e) => m.reactions.insert(peer_id, e),
+                        None => m.reactions.remove(&peer_id),
+                    };
+                    self.dirty = true;
+                }
+            }
             NetEvent::Typing { peer_id } => {
                 self.typing
                     .insert(peer_id, Instant::now() + Duration::from_secs(5));
@@ -792,6 +830,130 @@ impl LanChatApp {
         }
     }
 
+    /// Bir mesajın karşı taraflara giden kopyaları: "Herkese" özetinde kişilere
+    /// giden mesajlar, normal mesajda kendisi. (kişi kimliği, mesaj kimliği)
+    fn copies_of(&self, msg_id: &str) -> Vec<(String, String)> {
+        let Some(m) = self.messages.iter().find(|m| m.id == msg_id) else {
+            return Vec::new();
+        };
+        if m.peer_id == BROADCAST {
+            m.children
+                .iter()
+                .filter_map(|id| self.messages.iter().find(|x| &x.id == id))
+                .map(|x| (x.peer_id.clone(), x.id.clone()))
+                .collect()
+        } else {
+            vec![(m.peer_id.clone(), m.id.clone())]
+        }
+    }
+
+    /// Kişiye kısa bir bildirim (düzeltme, tepki…) gönderir. Kişi çevrimdışıysa `false`.
+    fn send_signal(&self, peer_id: &str, signal: Signal) -> bool {
+        let addr = self
+            .peer(peer_id)
+            .filter(|p| p.online())
+            .and_then(|p| p.addr);
+        let (Some(net), Some(addr), true) = (&self.net, addr, self.is_paired(peer_id)) else {
+            return false;
+        };
+        let peer = peer_id.to_string();
+        match signal {
+            Signal::Edit { msg_id, text } => net.send_edit(addr, peer, msg_id, text),
+            Signal::React { msg_id, emoji } => net.send_react(addr, peer, msg_id, emoji),
+        }
+        true
+    }
+
+    /// Mesaja tepki verir; aynı tepki seçiliyse kaldırır.
+    fn react(&mut self, msg_id: &str, emoji: &str) {
+        let me = self.cfg.id.clone();
+        let Some(m) = self.messages.iter().find(|m| m.id == msg_id) else {
+            return;
+        };
+        let new =
+            (m.reactions.get(&me).map(String::as_str) != Some(emoji)).then(|| emoji.to_string());
+        let copies = self.copies_of(msg_id);
+        let mut ids: Vec<&str> = copies.iter().map(|(_, id)| id.as_str()).collect();
+        ids.push(msg_id);
+        for m in self
+            .messages
+            .iter_mut()
+            .filter(|m| ids.contains(&m.id.as_str()))
+        {
+            match &new {
+                Some(e) => m.reactions.insert(me.clone(), e.clone()),
+                None => m.reactions.remove(&me),
+            };
+        }
+        self.dirty = true;
+        let mut offline = 0;
+        for (peer, id) in copies {
+            let signal = Signal::React {
+                msg_id: id,
+                emoji: new.clone(),
+            };
+            if !self.send_signal(&peer, signal) {
+                offline += 1;
+            }
+        }
+        if offline > 0 {
+            self.show_toast("Karşı taraf çevrimdışı; tepkiniz ona iletilemedi");
+        }
+    }
+
+    fn start_edit(&mut self, msg_id: &str) {
+        let Some(m) = self
+            .messages
+            .iter()
+            .find(|m| m.id == msg_id && m.outgoing && !m.deleted)
+        else {
+            return;
+        };
+        let Body::Text(text) = &m.body else { return };
+        let Some(chat) = self.selected.clone() else {
+            return;
+        };
+        self.input = text.clone();
+        self.replying = None;
+        self.editing = Some((chat, msg_id.to_string()));
+    }
+
+    /// Düzenlenen mesajı kaydeder ve karşı taraflarda da düzeltir.
+    fn apply_edit(&mut self, msg_id: &str, text: String) {
+        let copies = self.copies_of(msg_id);
+        let mut ids: Vec<&str> = copies.iter().map(|(_, id)| id.as_str()).collect();
+        ids.push(msg_id);
+        let mut changed = false;
+        for m in self
+            .messages
+            .iter_mut()
+            .filter(|m| ids.contains(&m.id.as_str()) && m.outgoing && !m.deleted)
+        {
+            if matches!(&m.body, Body::Text(t) if *t != text) {
+                m.body = Body::Text(text.clone());
+                m.edited = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.dirty = true;
+        let mut offline = 0;
+        for (peer, id) in copies {
+            let signal = Signal::Edit {
+                msg_id: id,
+                text: text.clone(),
+            };
+            if !self.send_signal(&peer, signal) {
+                offline += 1;
+            }
+        }
+        if offline > 0 {
+            self.show_toast("Mesaj sizde düzeltildi; karşı taraf çevrimdışı olduğu için onda eski hâli kalabilir");
+        }
+    }
+
     /// Görünen resim mesajlarının önizlemesini arka planda hazırlar.
     fn request_thumbs(&mut self, ctx: &egui::Context, ids: Vec<String>) {
         for id in ids {
@@ -927,6 +1089,21 @@ impl LanChatApp {
             .collect()
     }
 
+    /// "Herkese" özetinde kişilerin kendi kopyalarına verdiği tepkiler.
+    fn summary_reactions(&self, m: &ChatMessage) -> BTreeMap<String, String> {
+        let mut all = m.reactions.clone();
+        for id in &m.children {
+            if let Some(c) = self.messages.iter().find(|x| &x.id == id) {
+                for (who, e) in &c.reactions {
+                    if *who != self.cfg.id {
+                        all.insert(who.clone(), e.clone());
+                    }
+                }
+            }
+        }
+        all
+    }
+
     /// "Herkese" sohbetindeki özet mesajın durumu (kopyaların durumundan).
     fn broadcast_status(&self, m: &ChatMessage) -> String {
         let kids: Vec<&ChatMessage> = m
@@ -957,6 +1134,13 @@ impl LanChatApp {
     fn send_text(&mut self) {
         let text = self.input.trim_end().to_string();
         if text.trim().is_empty() {
+            return;
+        }
+        if let Some((chat, id)) = self.editing.take()
+            && Some(&chat) == self.selected.as_ref()
+        {
+            self.apply_edit(&id, text);
+            self.input.clear();
             return;
         }
         let Some(net) = self.net.clone() else { return };
@@ -1667,6 +1851,38 @@ impl LanChatApp {
         if cancel_reply {
             self.replying = None;
         }
+        let mut cancel_edit = false;
+        if let Some((chat, _)) = &self.editing
+            && Some(chat) == current.as_ref()
+        {
+            Frame::new()
+                .fill(ui.visuals().faint_bg_color)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("✏ Mesajı düzenliyorsunuz").strong().small());
+                        ui.label(RichText::new("Enter: kaydet · Esc: vazgeç").small().weak());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .small_button("✖")
+                                .on_hover_text("Düzenlemeyi iptal et")
+                                .clicked()
+                            {
+                                cancel_edit = true;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(4.0);
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                cancel_edit = true;
+            }
+        }
+        if cancel_edit {
+            self.editing = None;
+            self.input.clear();
+        }
         ui.horizontal(|ui| {
             let mut picked: Option<Vec<PathBuf>> = None;
             ui.menu_button(RichText::new("📎").size(18.0), |ui| {
@@ -1694,7 +1910,7 @@ impl LanChatApp {
                 .desired_rows(2)
                 .desired_width(ui.available_width() - send_w - 8.0)
                 .hint_text("Mesaj yazın…  (Enter: gönder, Shift+Enter: yeni satır)");
-            if ui.add(edit).changed() && !self.input.trim().is_empty() {
+            if ui.add(edit).changed() && !self.input.trim().is_empty() && self.editing.is_none() {
                 self.notify_typing();
             }
             let send = ui.add_sized(
@@ -1906,6 +2122,12 @@ impl LanChatApp {
 
         let mut actions: Vec<Action> = Vec::new();
         let mut wanted_thumbs: Vec<String> = Vec::new();
+        let names: HashMap<String, String> = self
+            .peers
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .chain([(self.cfg.id.clone(), "Siz".to_string())])
+            .collect();
         egui::CentralPanel::default().show(ui, |ui| {
             ScrollArea::vertical()
                 .stick_to_bottom(true)
@@ -1957,7 +2179,19 @@ impl LanChatApp {
                         {
                             wanted_thumbs.push(m.id.clone());
                         }
-                        message_bubble(ui, m, status, thumb, &mut actions);
+                        let reactions = if is_broadcast {
+                            Cow::Owned(self.summary_reactions(m))
+                        } else {
+                            Cow::Borrowed(&m.reactions)
+                        };
+                        let ctx = BubbleCtx {
+                            status,
+                            thumb,
+                            reactions: &reactions,
+                            my_id: &self.cfg.id,
+                            names: &names,
+                        };
+                        message_bubble(ui, m, ctx, &mut actions);
                         ui.add_space(4.0);
                     }
                     ui.add_space(4.0);
@@ -1987,6 +2221,11 @@ impl LanChatApp {
                     self.dirty = true;
                 }
                 Action::DeleteForAll(id) => self.delete_for_all(&id),
+                Action::Edit(id) => {
+                    self.start_edit(&id);
+                    ui.memory_mut(|m| m.request_focus(Id::unique(INPUT_ID)));
+                }
+                Action::React(id, emoji) => self.react(&id, emoji),
             }
         }
     }
@@ -2345,6 +2584,34 @@ enum Action {
     Reply(String),
     DeleteLocal(String),
     DeleteForAll(String),
+    Edit(String),
+    React(String, &'static str),
+}
+
+/// Mesaja verilebilecek tepkiler
+const REACTIONS: [&str; 6] = ["👍", "❤", "😂", "😮", "😢", "🙏"];
+
+/// Kişiye gönderilen kısa bildirimler
+enum Signal {
+    Edit {
+        msg_id: String,
+        text: String,
+    },
+    React {
+        msg_id: String,
+        emoji: Option<String>,
+    },
+}
+
+/// Balonun çizilmesi için gereken ek bilgiler
+struct BubbleCtx<'a> {
+    /// "Herkese" sohbetindeki özet mesajlar için toplu teslim durumu
+    status: Option<String>,
+    thumb: Option<&'a egui::TextureHandle>,
+    reactions: &'a BTreeMap<String, String>,
+    my_id: &'a str,
+    /// Kişi kimliği → görünen ad
+    names: &'a HashMap<String, String>,
 }
 
 /// Silinen mesajın içeriğini temizler.
@@ -2355,14 +2622,14 @@ fn clear_message(m: &mut ChatMessage) {
     m.note = None;
 }
 
-/// `status`: "Herkese" sohbetindeki özet mesajlar için toplu teslim durumu.
-fn message_bubble(
-    ui: &mut egui::Ui,
-    m: &ChatMessage,
-    status: Option<String>,
-    thumb: Option<&egui::TextureHandle>,
-    actions: &mut Vec<Action>,
-) {
+fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &mut Vec<Action>) {
+    let BubbleCtx {
+        status,
+        thumb,
+        reactions,
+        my_id,
+        names,
+    } = bc;
     let dark = ui.visuals().dark_mode;
     let fill = match (m.outgoing, dark) {
         (true, false) => Color32::from_rgb(219, 234, 254),
@@ -2426,8 +2693,14 @@ fn message_bubble(
                         }
                         Body::File { .. } => file_body(ui, m, thumb, actions),
                     }
+                    if !reactions.is_empty() && !m.deleted {
+                        reaction_chips(ui, m, reactions, my_id, names, actions);
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format_time(m.ts)).small().weak());
+                        if m.edited && !m.deleted {
+                            ui.label(RichText::new("düzenlendi").small().italics().weak());
+                        }
                         if let Some(st) = &status {
                             let col = if st.starts_with('✔') {
                                 Color32::from_rgb(34, 197, 94)
@@ -2504,6 +2777,28 @@ fn message_bubble(
 
         let is_summary = m.peer_id == BROADCAST;
         resp.context_menu(|ui| {
+            if !m.deleted && m.state == MsgState::Done {
+                ui.horizontal(|ui| {
+                    let mine = reactions.get(my_id).map(String::as_str);
+                    for e in REACTIONS {
+                        let b = egui::Button::selectable(mine == Some(e), RichText::new(e).size(18.0));
+                        if ui.add(b).clicked() {
+                            actions.push(Action::React(m.id.clone(), e));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+            }
+            if m.outgoing
+                && !m.deleted
+                && matches!(m.body, Body::Text(_))
+                && m.state == MsgState::Done
+                && ui.button("✏ Düzenle").clicked()
+            {
+                actions.push(Action::Edit(m.id.clone()));
+                ui.close();
+            }
             if !m.deleted && !is_summary {
                 if ui.button("↩ Yanıtla").clicked() {
                     actions.push(Action::Reply(m.id.clone()));
@@ -2534,6 +2829,52 @@ fn message_bubble(
                 ui.close();
             }
         });
+    });
+}
+
+/// Balonun altındaki tepkiler: aynı emojiler sayıyla birlikte gruplanır.
+fn reaction_chips(
+    ui: &mut egui::Ui,
+    m: &ChatMessage,
+    reactions: &BTreeMap<String, String>,
+    my_id: &str,
+    names: &HashMap<String, String>,
+    actions: &mut Vec<Action>,
+) {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (who, e) in reactions {
+        match groups.iter_mut().find(|(g, _)| g == e) {
+            Some((_, v)) => v.push(who),
+            None => groups.push((e, vec![who])),
+        }
+    }
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (emoji, who) in groups {
+            let mine = who.contains(&my_id);
+            let label = if who.len() > 1 {
+                format!("{emoji} {}", who.len())
+            } else {
+                emoji.to_string()
+            };
+            let who_names: Vec<&str> = who
+                .iter()
+                .map(|w| names.get(*w).map(String::as_str).unwrap_or("?"))
+                .collect();
+            let resp = ui
+                .add(
+                    egui::Button::selectable(mine, RichText::new(label).size(16.0))
+                        .corner_radius(CornerRadius::same(10)),
+                )
+                .on_hover_text(who_names.join(", "));
+            // Kendi tepkimize tıklayınca kaldırılır, başkasınınkine tıklayınca aynısı eklenir
+            if resp.clicked()
+                && let Some(e) = REACTIONS.iter().find(|r| **r == emoji)
+            {
+                actions.push(Action::React(m.id.clone(), e));
+            }
+        }
     });
 }
 

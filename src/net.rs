@@ -108,6 +108,18 @@ pub enum NetEvent {
         peer_id: String,
         msg_id: String,
     },
+    /// Karşı taraf bize gönderdiği bir metin mesajını düzeltti
+    Edited {
+        peer_id: String,
+        msg_id: String,
+        text: String,
+    },
+    /// Karşı taraf bir mesaja tepki verdi (ya da tepkisini kaldırdı)
+    Reacted {
+        peer_id: String,
+        msg_id: String,
+        emoji: Option<String>,
+    },
     /// Dosya/klasör gelmeye başladı (ya da yarım kalan aktarım devam ediyor).
     IncomingTransfer {
         from: protocol::From,
@@ -732,6 +744,31 @@ impl Net {
                     });
                 }
             }
+            Packet::Edit { from, msg_id, text } => {
+                if self.is_authorized(&from.id, &remote) {
+                    self.emit(NetEvent::Edited {
+                        peer_id: from.id,
+                        msg_id,
+                        text,
+                    });
+                }
+            }
+            Packet::React {
+                from,
+                msg_id,
+                emoji,
+            } => {
+                // Tepki kısa bir emoji olmalı; uzun metinler yok sayılır
+                if self.is_authorized(&from.id, &remote)
+                    && emoji.as_ref().is_none_or(|e| e.chars().count() <= 4)
+                {
+                    self.emit(NetEvent::Reacted {
+                        peer_id: from.id,
+                        msg_id,
+                        emoji,
+                    });
+                }
+            }
             Packet::Text {
                 from,
                 msg_id,
@@ -1118,6 +1155,32 @@ impl Net {
         let packet = Packet::Delete {
             from: self.me(),
             msg_id,
+        };
+        self.send_signal(addr, peer_id, packet);
+    }
+
+    /// Gönderdiğimiz metin mesajını karşı tarafta da düzeltir.
+    pub fn send_edit(&self, addr: SocketAddr, peer_id: String, msg_id: String, text: String) {
+        let packet = Packet::Edit {
+            from: self.me(),
+            msg_id,
+            text,
+        };
+        self.send_signal(addr, peer_id, packet);
+    }
+
+    /// Bir mesaja tepki gönderir (`None`: tepkiyi kaldırır).
+    pub fn send_react(
+        &self,
+        addr: SocketAddr,
+        peer_id: String,
+        msg_id: String,
+        emoji: Option<String>,
+    ) {
+        let packet = Packet::React {
+            from: self.me(),
+            msg_id,
+            emoji,
         };
         self.send_signal(addr, peer_id, packet);
     }
@@ -1961,12 +2024,13 @@ mod tests {
     }
 
     #[test]
-    fn reply_and_delete_between_paired_peers() {
+    fn reply_edit_react_delete_between_paired_peers() {
         let d = temp_dir("rd");
         let (a, rx_a) = start("A", &d);
         let (b, rx_b) = start("B", &d);
         pair_up(&a, "A", &b, "B");
         let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+        let addr_a: SocketAddr = ([127, 0, 0, 1], a.tcp_port()).into();
 
         let quote = protocol::ReplyRef {
             id: "orijinal".into(),
@@ -1997,15 +2061,46 @@ mod tests {
         };
         assert_eq!((peer_id.as_str(), msg_id.as_str()), ("A", "y1"));
 
-        // Eşleşmemiş biri silme isteği gönderemez
+        a.send_edit(addr_b, "B".into(), "y1".into(), "Saat 4'te".into());
+        let NetEvent::Edited {
+            peer_id,
+            msg_id,
+            text,
+        } = wait_for(&rx_b, |e| matches!(e, NetEvent::Edited { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (peer_id.as_str(), msg_id.as_str(), text.as_str()),
+            ("A", "y1", "Saat 4'te")
+        );
+
+        b.send_react(addr_a, "A".into(), "y1".into(), Some("👍".into()));
+        let NetEvent::Reacted { peer_id, emoji, .. } =
+            wait_for(&rx_a, |e| matches!(e, NetEvent::Reacted { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!((peer_id.as_str(), emoji.as_deref()), ("B", Some("👍")));
+        b.send_react(addr_a, "A".into(), "y1".into(), None);
+        let NetEvent::Reacted { emoji, .. } =
+            wait_for(&rx_a, |e| matches!(e, NetEvent::Reacted { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(emoji, None);
+
+        // Eşleşmemiş biri silemez, düzeltemez, tepki veremez
         let (c, _rx_c) = start("C", &d);
         c.set_trusted(HashMap::from([("B".to_string(), b.public_key())]));
         c.send_delete(addr_b, "B".into(), "y1".into());
+        c.send_edit(addr_b, "B".into(), "y1".into(), "sahte".into());
+        c.send_react(addr_b, "B".into(), "y1".into(), Some("👍".into()));
         std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            rx_b.try_iter()
-                .all(|e| !matches!(e, NetEvent::Deleted { .. }))
-        );
+        assert!(rx_b.try_iter().all(|e| !matches!(
+            e,
+            NetEvent::Deleted { .. } | NetEvent::Edited { .. } | NetEvent::Reacted { .. }
+        )));
         fs::remove_dir_all(d).unwrap();
     }
 

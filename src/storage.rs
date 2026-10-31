@@ -3,7 +3,7 @@
 use crate::secure::{Identity, PublicKey};
 use crate::vault::{self, VaultError, VaultKey};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -116,6 +116,12 @@ pub struct ChatMessage {
     /// "Herkese" gönderilen mesajın kişilere giden kopyaları (mesaj kimlikleri)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<String>,
+    /// Gönderildikten sonra düzeltildi mi?
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
+    /// Tepkiler: kişi kimliği (bizim için kendi hesap kimliğimiz) → emoji
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reactions: BTreeMap<String, String>,
     /// Aktarılan bayt (yalnızca aktarım sürerken anlamlı)
     #[serde(skip)]
     pub progress: u64,
@@ -138,6 +144,8 @@ impl ChatMessage {
             reply_to: None,
             deleted: false,
             children: Vec::new(),
+            edited: false,
+            reactions: BTreeMap::new(),
             progress: 0,
             speed: Speed::default(),
         }
