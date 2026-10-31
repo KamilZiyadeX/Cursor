@@ -143,6 +143,11 @@ pub struct LanChatApp {
     replying: Option<(String, ReplyRef)>,
     /// Düzenlenen mesaj (hangi sohbette, mesaj kimliği)
     editing: Option<(String, String)>,
+    /// Pencere sallanıyor: (başlangıç, pencerenin asıl konumu)
+    shake: Option<(Instant, egui::Pos2)>,
+    /// Kişi başına son gelen/giden titreşim (art arda titreşimi sınırlamak için)
+    last_nudge_in: HashMap<String, Instant>,
+    last_nudge_out: HashMap<String, Instant>,
     /// Açık arama: (hangi sohbette, aranan metin)
     search: Option<(String, String)>,
     /// Arama kutusuna odaklanılsın mı (bir kerelik)
@@ -268,6 +273,9 @@ impl LanChatApp {
             last_typing_sent: None,
             replying: None,
             editing: None,
+            shake: None,
+            last_nudge_in: HashMap::new(),
+            last_nudge_out: HashMap::new(),
             search: None,
             search_focus: false,
             thumbs: HashMap::new(),
@@ -583,6 +591,35 @@ impl LanChatApp {
                     self.dirty = true;
                 }
             }
+            NetEvent::Nudged { peer_id } => {
+                // Art arda gelen titreşimler yok sayılır
+                if self
+                    .last_nudge_in
+                    .get(&peer_id)
+                    .is_some_and(|t| t.elapsed() < NUDGE_COOLDOWN - Duration::from_secs(2))
+                {
+                    return;
+                }
+                self.last_nudge_in.insert(peer_id.clone(), Instant::now());
+                self.push_message(ChatMessage {
+                    read_sent: true,
+                    ..ChatMessage::new(
+                        new_id(),
+                        peer_id.clone(),
+                        false,
+                        Body::Nudge,
+                        MsgState::Done,
+                    )
+                });
+                self.on_incoming(ctx, &peer_id, "📳 Titreşim gönderdi");
+                // MSN'deki gibi: pencere öne gelir, sohbet açılır ve pencere sallanır
+                if self.hidden || !self.focused {
+                    self.unread.remove(&peer_id);
+                    self.selected = Some(peer_id);
+                }
+                self.show_window(ctx);
+                self.start_shake(ctx);
+            }
             NetEvent::Typing { peer_id } => {
                 self.typing
                     .insert(peer_id, Instant::now() + Duration::from_secs(5));
@@ -794,6 +831,7 @@ impl LanChatApp {
         let preview = match &m.body {
             Body::Text(t) => t.replace('\n', " "),
             Body::File { name, .. } => format!("📄 {name}"),
+            Body::Nudge => return,
         };
         let reply = ReplyRef {
             id: m.id.clone(),
@@ -860,6 +898,7 @@ impl LanChatApp {
         match signal {
             Signal::Edit { msg_id, text } => net.send_edit(addr, peer, msg_id, text),
             Signal::React { msg_id, emoji } => net.send_react(addr, peer, msg_id, emoji),
+            Signal::Nudge => net.send_nudge(addr, peer),
         }
         true
     }
@@ -899,6 +938,67 @@ impl LanChatApp {
         if offline > 0 {
             self.show_toast("Karşı taraf çevrimdışı; tepkiniz ona iletilemedi");
         }
+    }
+
+    /// Seçili kişiye titreşim gönderir.
+    fn send_nudge(&mut self, ctx: &egui::Context) {
+        let Some(peer_id) = self.selected.clone() else {
+            return;
+        };
+        if let Some(t) = self.last_nudge_out.get(&peer_id) {
+            let left = NUDGE_COOLDOWN.saturating_sub(t.elapsed());
+            if !left.is_zero() {
+                self.show_toast(format!(
+                    "Biraz bekleyin: {} sn sonra yeniden titreşim gönderebilirsiniz",
+                    left.as_secs() + 1
+                ));
+                return;
+            }
+        }
+        if !self.send_signal(&peer_id, Signal::Nudge) {
+            self.show_toast("Kişi çevrimdışı; titreşim gönderilemedi");
+            return;
+        }
+        self.last_nudge_out.insert(peer_id.clone(), Instant::now());
+        self.push_message(ChatMessage::new(
+            new_id(),
+            peer_id,
+            true,
+            Body::Nudge,
+            MsgState::Done,
+        ));
+        self.start_shake(ctx);
+    }
+
+    /// Pencereyi kısa bir süre sallar.
+    fn start_shake(&mut self, ctx: &egui::Context) {
+        if self.shake.is_some() {
+            return;
+        }
+        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            self.shake = Some((Instant::now(), rect.min));
+            ctx.request_repaint();
+        }
+    }
+
+    fn shake_logic(&mut self, ctx: &egui::Context) {
+        let Some((start, origin)) = self.shake else {
+            return;
+        };
+        let t = start.elapsed().as_secs_f32();
+        let total = SHAKE_TIME.as_secs_f32();
+        if t >= total {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
+            self.shake = None;
+            return;
+        }
+        let amp = 14.0 * (1.0 - t / total);
+        let dx = (t * std::f32::consts::TAU * 16.0).sin() * amp;
+        let dy = (t * std::f32::consts::TAU * 11.0).cos() * amp * 0.5;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+            origin + egui::vec2(dx, dy),
+        ));
+        ctx.request_repaint();
     }
 
     fn start_edit(&mut self, msg_id: &str) {
@@ -1278,7 +1378,7 @@ impl LanChatApp {
         match m.body {
             Body::Text(t) => net.send_reply(addr, m.peer_id, m.id, t, m.reply_to),
             Body::File { path: Some(p), .. } => net.send_path(addr, m.peer_id, m.id, p),
-            Body::File { path: None, .. } => {}
+            Body::File { path: None, .. } | Body::Nudge => {}
         }
     }
 
@@ -1904,6 +2004,15 @@ impl LanChatApp {
             if let Some(paths) = picked {
                 self.send_paths(paths);
             }
+            if current.as_deref() != Some(BROADCAST)
+                && ui
+                    .button(RichText::new("📳").size(18.0))
+                    .on_hover_text("Titreşim gönder: karşı tarafın penceresi öne gelir ve sallanır")
+                    .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.send_nudge(&ctx);
+            }
             let send_w = 80.0;
             let edit = TextEdit::multiline(&mut self.input)
                 .id(input_id)
@@ -2161,6 +2270,10 @@ impl LanChatApp {
                                 ui.add_space(2.0);
                             });
                             last_day = day;
+                        }
+                        if matches!(m.body, Body::Nudge) {
+                            nudge_line(ui, m, &name);
+                            continue;
                         }
                         let status = is_broadcast.then(|| self.broadcast_status(m));
                         let thumb = match self.thumbs.get(&m.id) {
@@ -2588,6 +2701,11 @@ enum Action {
     React(String, &'static str),
 }
 
+/// Aynı kişiye art arda titreşim gönderilemeyecek süre
+const NUDGE_COOLDOWN: Duration = Duration::from_secs(10);
+/// Pencerenin sallanma süresi
+const SHAKE_TIME: Duration = Duration::from_millis(700);
+
 /// Mesaja verilebilecek tepkiler
 const REACTIONS: [&str; 6] = ["👍", "❤", "😂", "😮", "😢", "🙏"];
 
@@ -2601,6 +2719,7 @@ enum Signal {
         msg_id: String,
         emoji: Option<String>,
     },
+    Nudge,
 }
 
 /// Balonun çizilmesi için gereken ek bilgiler
@@ -2692,6 +2811,7 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &m
                             ui.add(egui::Label::new(RichText::new(t).size(15.0)).wrap());
                         }
                         Body::File { .. } => file_body(ui, m, thumb, actions),
+                        Body::Nudge => {}
                     }
                     if !reactions.is_empty() && !m.deleted {
                         reaction_chips(ui, m, reactions, my_id, names, actions);
@@ -2829,6 +2949,28 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &m
                 ui.close();
             }
         });
+    });
+}
+
+/// Titreşim: sohbetin ortasında küçük bir satır.
+fn nudge_line(ui: &mut egui::Ui, m: &ChatMessage, peer_name: &str) {
+    let text = if m.outgoing {
+        "📳 Titreşim gönderdiniz".to_string()
+    } else {
+        format!("📳 {peer_name} titreşim gönderdi")
+    };
+    ui.vertical_centered(|ui| {
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{text} · {}", format_time(m.ts)))
+                    .small()
+                    .italics()
+                    .color(Color32::from_rgb(234, 88, 12)),
+            )
+            .wrap(),
+        );
+        ui.add_space(2.0);
     });
 }
 
@@ -3003,6 +3145,7 @@ impl eframe::App for LanChatApp {
         }
 
         self.desktop_logic(ctx);
+        self.shake_logic(ctx);
         self.focused = !self.hidden && ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if self.focused
             && let Some(sel) = &self.selected
@@ -3182,6 +3325,7 @@ fn message_matches(m: &ChatMessage, folded_query: &str) -> bool {
     let body = match &m.body {
         Body::Text(t) => t.as_str(),
         Body::File { name, .. } => name.as_str(),
+        Body::Nudge => "titreşim",
     };
     fold_tr(body).contains(folded_query)
         || m.reply_to

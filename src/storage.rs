@@ -80,6 +80,8 @@ pub enum Body {
         #[serde(default)]
         file_count: u64,
     },
+    /// Titreşim (MSN'deki gibi); sohbette ortada küçük bir satır olarak görünür
+    Nudge,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

@@ -131,6 +131,8 @@ pub enum Packet {
         msg_id: String,
         text: String,
     },
+    /// Titreşim: alıcının penceresi öne gelir ve sallanır
+    Nudge { from: From },
     /// Bir mesaja tepki (👍 gibi); `emoji` yoksa gönderenin tepkisi kaldırılır
     React {
         from: From,

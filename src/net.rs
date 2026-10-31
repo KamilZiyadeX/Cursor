@@ -114,6 +114,10 @@ pub enum NetEvent {
         msg_id: String,
         text: String,
     },
+    /// Karşı taraf titreşim gönderdi
+    Nudged {
+        peer_id: String,
+    },
     /// Karşı taraf bir mesaja tepki verdi (ya da tepkisini kaldırdı)
     Reacted {
         peer_id: String,
@@ -744,6 +748,11 @@ impl Net {
                     });
                 }
             }
+            Packet::Nudge { from } => {
+                if self.is_authorized(&from.id, &remote) {
+                    self.emit(NetEvent::Nudged { peer_id: from.id });
+                }
+            }
             Packet::Edit { from, msg_id, text } => {
                 if self.is_authorized(&from.id, &remote) {
                     self.emit(NetEvent::Edited {
@@ -1166,6 +1175,12 @@ impl Net {
             msg_id,
             text,
         };
+        self.send_signal(addr, peer_id, packet);
+    }
+
+    /// Titreşim gönderir.
+    pub fn send_nudge(&self, addr: SocketAddr, peer_id: String) {
+        let packet = Packet::Nudge { from: self.me() };
         self.send_signal(addr, peer_id, packet);
     }
 
@@ -2075,6 +2090,14 @@ mod tests {
             ("A", "y1", "Saat 4'te")
         );
 
+        a.send_nudge(addr_b, "B".into());
+        let NetEvent::Nudged { peer_id } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::Nudged { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(peer_id, "A");
+
         b.send_react(addr_a, "A".into(), "y1".into(), Some("👍".into()));
         let NetEvent::Reacted { peer_id, emoji, .. } =
             wait_for(&rx_a, |e| matches!(e, NetEvent::Reacted { .. }))
@@ -2096,10 +2119,14 @@ mod tests {
         c.send_delete(addr_b, "B".into(), "y1".into());
         c.send_edit(addr_b, "B".into(), "y1".into(), "sahte".into());
         c.send_react(addr_b, "B".into(), "y1".into(), Some("👍".into()));
+        c.send_nudge(addr_b, "B".into());
         std::thread::sleep(Duration::from_millis(500));
         assert!(rx_b.try_iter().all(|e| !matches!(
             e,
-            NetEvent::Deleted { .. } | NetEvent::Edited { .. } | NetEvent::Reacted { .. }
+            NetEvent::Deleted { .. }
+                | NetEvent::Edited { .. }
+                | NetEvent::Reacted { .. }
+                | NetEvent::Nudged { .. }
         )));
         fs::remove_dir_all(d).unwrap();
     }
