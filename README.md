@@ -165,3 +165,5 @@ Kapo PDF ile aynı aileden: parlak kırmızı zemin, üst üste duran beyaz konu
 - `assets/logo/lanchat-medium.svg`: masaüstü boyutları (32, 40 ve 48 px) için; düğümler ve harfler daha büyük.
 - `assets/logo/lanchat-16.svg`, `-24`: pencere başlığı ve görev çubuğu gibi en küçük yerler için piksel ızgarasına göre çizilmiş sade sürümler (`lanchat-small-48.svg` uygulama içi üst çubukta kullanılır).
 - `assets/icon/`: bu çizimlerden üretilmiş PNG'ler ve hepsini içeren `lanchat.ico`. Pencere simgesi, uygulama içi logo ve Windows'ta `.exe` simgesi buradan alınır.
+
+Windows Gezgini simgeleri önbellekte tuttuğu için bir güncellemede logo değişirse masaüstünde eski simge kalabilir. LanChat açılırken gömülü simgenin değişip değişmediğine bakar; değiştiyse Gezgin'e LanChat dosyasının ve masaüstündeki LanChat kısayollarının simgesinin yenilenmesi gerektiğini bildirir (`src/shell_icon.rs`). Buna rağmen eski simge kalırsa: Görev Yöneticisi → Windows Gezgini → Yeniden başlat.

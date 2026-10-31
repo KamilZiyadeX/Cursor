@@ -6,12 +6,16 @@ mod net;
 mod protocol;
 mod root;
 mod secure;
+mod shell_icon;
 mod storage;
 mod vault;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Simge bu sürümde değiştiyse Windows Gezgini'ne haber ver (arka planda)
+    std::thread::spawn(|| shell_icon::refresh_if_changed(&storage::root_dir()));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LanChat")

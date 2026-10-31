@@ -2142,6 +2142,7 @@ dependencies = [
  "snow",
  "socket2",
  "uuid",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
