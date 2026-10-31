@@ -35,6 +35,12 @@ pub struct Config {
     /// LanChat'in kendi sesi yerine Windows'un bildirim sesini kullan
     #[serde(default)]
     pub windows_sound: bool,
+    /// Görünüm: sistem / açık / koyu
+    #[serde(default)]
+    pub theme: ThemeChoice,
+    /// Yazı ve arayüz büyüklüğü (1.0 = normal)
+    #[serde(default = "normal_zoom")]
+    pub zoom: f32,
     /// "Tepside çalışmaya devam ediyor" bilgisi gösterildi mi?
     #[serde(default)]
     pub tray_hint_shown: bool,
@@ -42,6 +48,19 @@ pub struct Config {
 
 fn yes() -> bool {
     true
+}
+
+fn normal_zoom() -> f32 {
+    1.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub enum ThemeChoice {
+    /// Windows'un ayarına uy
+    #[default]
+    Sistem,
+    Acik,
+    Koyu,
 }
 
 const SHOW_REQUEST: &str = "goster";
@@ -317,6 +336,8 @@ impl Config {
             close_to_tray: true,
             notifications: true,
             notification_sound: true,
+            theme: ThemeChoice::Sistem,
+            zoom: 1.0,
             windows_sound: false,
             tray_hint_shown: false,
         }

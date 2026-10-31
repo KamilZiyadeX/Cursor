@@ -7,7 +7,7 @@ use crate::protocol::{self, ReplyRef};
 use crate::secure::PublicKey;
 use crate::storage::{
     self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Outgoing, Profile, Signal,
-    TrustedPeer,
+    ThemeChoice, TrustedPeer,
 };
 use crate::update;
 use chrono::{Local, TimeZone};
@@ -108,6 +108,8 @@ enum UpdateState {
 }
 
 struct Settings {
+    theme: ThemeChoice,
+    zoom: f32,
     speed: net::SpeedLimit,
     close_to_tray: bool,
     notifications: bool,
@@ -213,6 +215,7 @@ impl LanChatApp {
         let history = profile.load_history();
         let _ = storage::set_last_profile(&root_dir, &cfg.id);
 
+        apply_appearance(ctx, &cfg);
         let local_registry = Some(storage::online_dir(&root_dir));
         let logo = small_logo_texture(ctx);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
@@ -1603,6 +1606,8 @@ impl LanChatApp {
                 ui.menu_button("👤 Hesaplar", |ui| self.accounts_menu(ui));
                 if ui.button("⚙ Ayarlar").clicked() {
                     self.settings = Some(Settings {
+                        theme: self.cfg.theme,
+                        zoom: self.cfg.zoom,
                         speed: self.cfg.speed_limit,
                         close_to_tray: self.cfg.close_to_tray,
                         notifications: self.cfg.notifications,
@@ -2601,6 +2606,27 @@ impl LanChatApp {
                 });
                 ui.add_space(10.0);
 
+                ui.label(RichText::new("Görünüm").strong());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut s.theme, ThemeChoice::Sistem, "Windows'a uy");
+                    ui.radio_value(&mut s.theme, ThemeChoice::Acik, "☀ Açık");
+                    ui.radio_value(&mut s.theme, ThemeChoice::Koyu, "🌙 Koyu");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Yazı boyutu:");
+                    ui.add(
+                        egui::Slider::new(&mut s.zoom, 0.5..=2.0)
+                            .step_by(0.1)
+                            .custom_formatter(|v, _| format!("%{:.0}", v * 100.0)),
+                    );
+                });
+                ui.label(
+                    RichText::new("Ctrl + artı / eksi ile de büyütüp küçültebilirsiniz (Ctrl+0: normal).")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+
                 ui.label(RichText::new("Aktarım hızı").strong());
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut s.speed.enabled, "Gönderirken hızı sınırla:");
@@ -2807,6 +2833,9 @@ impl LanChatApp {
             self.cfg.manual_ips = s.manual_ips;
             self.cfg.trusted = s.trusted;
             self.cfg.speed_limit = s.speed;
+            self.cfg.theme = s.theme;
+            self.cfg.zoom = s.zoom;
+            apply_appearance(ctx, &self.cfg);
             self.cfg.close_to_tray = s.close_to_tray;
             self.cfg.notifications = s.notifications;
             self.cfg.notification_sound = s.notification_sound;
@@ -3380,6 +3409,15 @@ impl eframe::App for LanChatApp {
         }
 
         self.desktop_logic(ctx);
+        // Ctrl + artı/eksi ile değiştirilen büyüklüğü hatırla
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.cfg.zoom).abs() > 0.01 {
+            self.cfg.zoom = zoom;
+            if let Some(s) = &mut self.settings {
+                s.zoom = zoom;
+            }
+            let _ = self.cfg.save(&self.data_dir);
+        }
         self.shake_logic(ctx);
         self.focused = !self.hidden && ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if self.focused
@@ -3540,8 +3578,19 @@ pub fn open_account_window(profile_id: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// Hesabın tema ve yazı boyutu ayarını uygular.
+pub fn apply_appearance(ctx: &egui::Context, cfg: &Config) {
+    ctx.set_theme(match cfg.theme {
+        ThemeChoice::Sistem => egui::ThemePreference::System,
+        ThemeChoice::Acik => egui::ThemePreference::Light,
+        ThemeChoice::Koyu => egui::ThemePreference::Dark,
+    });
+    ctx.set_zoom_factor(cfg.zoom.clamp(0.5, 2.0));
+}
+
 pub fn setup_style(ctx: &egui::Context) {
-    ctx.global_style_mut(|style| {
+    // Hem koyu hem açık tema için (yalnızca etkin olana değil)
+    ctx.all_styles_mut(|style| {
         // Metinler fareyle seçilmez: mesaja sağ tıklanınca menü açılsın
         // (kopyalama menüdeki "Kopyala" ile)
         style.interaction.selectable_labels = false;
