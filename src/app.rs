@@ -6,6 +6,7 @@ use crate::secure::PublicKey;
 use crate::storage::{
     self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Profile, TrustedPeer,
 };
+use crate::update;
 use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
@@ -94,6 +95,14 @@ fn is_image(name: &str) -> bool {
 /// Önizleme için en fazla bu kadar büyük dosyalar çözülür.
 const THUMB_MAX_FILE: u64 = 64 * 1024 * 1024;
 
+/// Ağ üzerinden güncelleme durumu
+enum UpdateState {
+    Idle,
+    Downloading { from: String, done: u64, total: u64 },
+    Ready { path: PathBuf, version: String },
+    Failed(String),
+}
+
 struct Settings {
     speed: net::SpeedLimit,
     has_password: bool,
@@ -133,6 +142,11 @@ pub struct LanChatApp {
     thumbs: HashMap<String, Thumb>,
     thumb_tx: Sender<(String, Option<egui::ColorImage>)>,
     thumb_rx: Receiver<(String, Option<egui::ColorImage>)>,
+    /// Ağdaki cihazların LanChat sürümü ve platformu (kimliğe göre)
+    peer_versions: HashMap<String, (String, String)>,
+    update: UpdateState,
+    /// "Daha sonra" denilen sürüm (bu oturumda yeniden sorulmaz)
+    update_dismissed: Option<String>,
     out_pair: Option<OutPair>,
     in_pair: Option<InPair>,
     net: Option<Net>,
@@ -216,6 +230,9 @@ impl LanChatApp {
             thumbs: HashMap::new(),
             thumb_tx,
             thumb_rx,
+            peer_versions: HashMap::new(),
+            update: UpdateState::Idle,
+            update_dismissed: None,
             out_pair: None,
             in_pair: None,
             net,
@@ -363,6 +380,28 @@ impl LanChatApp {
                         ));
                     }
                 }
+            }
+            NetEvent::PeerVersion {
+                id,
+                version,
+                platform,
+            } => {
+                self.peer_versions.insert(id, (version, platform));
+            }
+            NetEvent::UpdateProgress { done, total } => {
+                if let UpdateState::Downloading {
+                    done: d, total: t, ..
+                } = &mut self.update
+                {
+                    *d = done;
+                    *t = total;
+                }
+            }
+            NetEvent::UpdateReady { path, version } => {
+                self.update = UpdateState::Ready { path, version };
+            }
+            NetEvent::UpdateFailed { error } => {
+                self.update = UpdateState::Failed(error);
             }
             NetEvent::Notice { text } => self.show_toast(text),
             NetEvent::Deleted { peer_id, msg_id } => {
@@ -955,6 +994,137 @@ impl LanChatApp {
         });
     }
 
+    /// Eşleşmiş, çevrimiçi ve aynı platformdaki cihazlar arasında bizimkinden
+    /// yeni LanChat'i olan (en yeni sürümlü) cihaz: (kimlik, ad, adres, sürüm)
+    fn update_offer(&self) -> Option<(String, String, SocketAddr, String)> {
+        let mut best: Option<(String, String, SocketAddr, String)> = None;
+        for p in &self.peers {
+            let (Some(addr), true) = (p.addr, p.online()) else {
+                continue;
+            };
+            if !(self.cfg.is_trusted(&p.id) || p.local) {
+                continue;
+            }
+            let Some((ver, plat)) = self.peer_versions.get(&p.id) else {
+                continue;
+            };
+            if *plat != protocol::platform() || !protocol::version_newer(ver, protocol::APP_VERSION)
+            {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|b| protocol::version_newer(ver, &b.3))
+            {
+                best = Some((p.id.clone(), p.name.clone(), addr, ver.clone()));
+            }
+        }
+        best
+    }
+
+    fn update_bar(&mut self, ui: &mut egui::Ui) {
+        let accent = Color32::from_rgb(220, 38, 38);
+        match &self.update {
+            UpdateState::Idle => {
+                let Some((id, name, addr, version)) = self.update_offer() else {
+                    return;
+                };
+                if self.update_dismissed.as_deref() == Some(version.as_str()) {
+                    return;
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "⬆ LanChat'in yeni sürümü ({version}) {name} bilgisayarında var. \
+                             Sizdeki: {}",
+                            protocol::APP_VERSION
+                        ))
+                        .color(accent),
+                    );
+                    if ui.button("Güncelle").clicked() {
+                        self.start_update(id, name, addr);
+                    }
+                    if ui.button("Daha sonra").clicked() {
+                        self.update_dismissed = Some(version);
+                    }
+                });
+            }
+            UpdateState::Downloading { from, done, total } => {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(format!("⬆ Yeni sürüm {from} bilgisayarından indiriliyor…"));
+                    let frac = if *total > 0 {
+                        *done as f32 / *total as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(180.0)
+                            .show_percentage(),
+                    );
+                });
+            }
+            UpdateState::Ready { version, .. } => {
+                let version = version.clone();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "✔ LanChat {version} indirildi ve doğrulandı. Yeniden başlatınca kurulacak."
+                        ))
+                        .color(Color32::from_rgb(22, 163, 74)),
+                    );
+                    if ui.button("Şimdi yeniden başlat").clicked() {
+                        self.install_update(ui.ctx());
+                    }
+                });
+            }
+            UpdateState::Failed(err) => {
+                let err = err.clone();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Güncelleme başarısız: {err}")).color(accent));
+                    if ui.button("Tamam").clicked() {
+                        self.update = UpdateState::Idle;
+                    }
+                });
+            }
+        }
+    }
+
+    fn start_update(&mut self, peer_id: String, name: String, addr: SocketAddr) {
+        let (Some(net), Ok(exe)) = (&self.net, std::env::current_exe()) else {
+            self.update = UpdateState::Failed("Programın yeri bulunamadı".into());
+            return;
+        };
+        net.request_update(addr, peer_id, update::download_path(&exe));
+        self.update = UpdateState::Downloading {
+            from: name,
+            done: 0,
+            total: 0,
+        };
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context) {
+        let UpdateState::Ready { path, .. } = &self.update else {
+            return;
+        };
+        let path = path.clone();
+        self.save_history();
+        let result = std::env::current_exe().and_then(|exe| {
+            update::install(&exe, &path)?;
+            update::restart(&exe, &self.cfg.id)
+        });
+        match result {
+            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                self.update = UpdateState::Failed(format!("Kurulamadı: {e}"));
+            }
+        }
+    }
+
     fn accounts_menu(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new(format!("Bu pencere: {}", self.cfg.name)).strong());
         ui.separator();
@@ -1271,6 +1441,11 @@ impl LanChatApp {
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("LanChat {}", protocol::APP_VERSION))
+                    .small()
+                    .weak(),
+            );
             if let Some(net) = &self.net {
                 let ips = net::local_ipv4_addresses();
                 let ip_text = if ips.is_empty() {
@@ -1286,7 +1461,11 @@ impl LanChatApp {
                         .small()
                         .weak(),
                 )
-                .on_hover_text(format!("Mesaj portu: {}", net.tcp_port()));
+                .on_hover_text(format!(
+                    "Mesaj portu: {}\nLanChat sürümü: {}",
+                    net.tcp_port(),
+                    protocol::APP_VERSION
+                ));
                 if let Some(err) = net.discovery_error() {
                     ui.label(
                         RichText::new(err)
@@ -2343,6 +2522,7 @@ impl eframe::App for LanChatApp {
             if let Some(err) = &self.startup_error {
                 ui.colored_label(Color32::from_rgb(220, 38, 38), err);
             }
+            self.update_bar(ui);
             ui.add_space(6.0);
         });
 

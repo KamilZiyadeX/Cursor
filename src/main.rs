@@ -8,6 +8,7 @@ mod root;
 mod secure;
 mod shell_icon;
 mod storage;
+mod update;
 mod vault;
 
 use eframe::egui;
@@ -15,6 +16,15 @@ use eframe::egui;
 fn main() -> eframe::Result {
     // Simge bu sürümde değiştiyse Windows Gezgini'ne haber ver (arka planda)
     std::thread::spawn(|| shell_icon::refresh_if_changed(&storage::root_dir()));
+    // Önceki güncellemeden kalan eski programı temizle (Windows'ta eski süreç
+    // kapanana kadar silinemeyebilir; biraz bekleyip yeniden dene)
+    update::cleanup_download();
+    std::thread::spawn(|| {
+        for _ in 0..10 {
+            update::cleanup_old();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

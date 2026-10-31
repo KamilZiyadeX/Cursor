@@ -4,9 +4,10 @@
 //! `NetEvent` olarak bir kanal üzerinden iletilir.
 
 use crate::protocol::{
-    self, ACK_ERR, ACK_OK, ACK_UNPAIRED, Accept, Beacon, Entry, Packet, PairReply,
+    self, ACK_ERR, ACK_OK, ACK_UNPAIRED, Accept, Beacon, Entry, Packet, PairReply, UpdateInfo,
 };
 use crate::secure::{self, Identity, PublicKey, SecureStream};
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -76,6 +77,24 @@ pub enum NetEvent {
     Read {
         peer_id: String,
         msg_ids: Vec<String>,
+    },
+    /// Ağdaki bir cihazın LanChat sürümü ve platformu
+    PeerVersion {
+        id: String,
+        version: String,
+        platform: String,
+    },
+    UpdateProgress {
+        done: u64,
+        total: u64,
+    },
+    /// Güncelleme indirildi ve doğrulandı
+    UpdateReady {
+        path: PathBuf,
+        version: String,
+    },
+    UpdateFailed {
+        error: String,
     },
     IncomingText {
         from: protocol::From,
@@ -618,6 +637,13 @@ impl Net {
             // Karşı tarafa da doğrudan duyuru gönder: yayın tek yönlü
             // ulaşıyorsa bile iki taraf birbirini görsün.
             self.add_target(src.ip());
+            if !b.ver.is_empty() {
+                self.emit(NetEvent::PeerVersion {
+                    id: b.id.clone(),
+                    version: b.ver.clone(),
+                    platform: b.plat.clone(),
+                });
+            }
             self.emit(NetEvent::PeerSeen {
                 id: b.id,
                 name: b.name,
@@ -690,6 +716,12 @@ impl Net {
                         peer_id: from.id,
                         msg_ids,
                     });
+                }
+            }
+            Packet::GetUpdate { from } => {
+                // Program yalnızca eşleşmiş cihazlara verilir
+                if self.is_authorized(&from.id, &remote) {
+                    let _ = self.serve_update(&mut stream);
                 }
             }
             Packet::Delete { from, msg_id } => {
@@ -979,6 +1011,105 @@ impl Net {
                 protocol::write_frame(&mut s, &packet)?;
                 s.flush()
             })();
+        });
+    }
+
+    /// Kendi programımızı güncelleme olarak gönderir.
+    fn serve_update(&self, stream: &mut SecureStream) -> io::Result<()> {
+        let exe = std::env::current_exe()?;
+        let size = fs::metadata(&exe)?.len();
+        let sha256 = sha256_file(&exe)?;
+        protocol::write_frame(
+            stream,
+            &UpdateInfo {
+                ok: true,
+                error: None,
+                version: protocol::APP_VERSION.into(),
+                platform: protocol::platform(),
+                size,
+                sha256,
+            },
+        )?;
+        let mut file = BufReader::with_capacity(1024 * 1024, File::open(&exe)?);
+        let never = AtomicBool::new(false);
+        protocol::copy_exact(&mut file, stream, size, &never, |_| {})?;
+        stream.flush()
+    }
+
+    /// Eşleşmiş bir cihazdan onun programını indirir, SHA-256 ile doğrular ve
+    /// `dest` dosyasına yazar. Sonuç `UpdateReady` ya da `UpdateFailed` ile bildirilir.
+    pub fn request_update(&self, addr: SocketAddr, peer_id: String, dest: PathBuf) {
+        let net = self.clone();
+        thread::spawn(move || {
+            let res = (|| -> io::Result<String> {
+                let mut s = net.secure_connect(addr, Some(&peer_id))?;
+                protocol::write_frame(&mut s, &Packet::GetUpdate { from: net.me() })?;
+                let info: UpdateInfo = protocol::read_frame(&mut s)?;
+                if !info.ok {
+                    return Err(io::Error::other(
+                        info.error
+                            .unwrap_or_else(|| "Karşı taraf güncellemeyi veremedi".into()),
+                    ));
+                }
+                if info.platform != protocol::platform() {
+                    return Err(io::Error::other("Karşı bilgisayarın platformu farklı"));
+                }
+                if info.size > 512 * 1024 * 1024 {
+                    return Err(io::Error::other(
+                        "Güncelleme dosyası beklenmedik kadar büyük",
+                    ));
+                }
+                let mut part = dest.as_os_str().to_owned();
+                part.push(".part");
+                let part = PathBuf::from(part);
+                let result = (|| -> io::Result<()> {
+                    let mut out = HashingWriter {
+                        inner: BufWriter::new(File::create(&part)?),
+                        hasher: Sha256::new(),
+                    };
+                    let never = AtomicBool::new(false);
+                    let mut last = Instant::now();
+                    protocol::copy_exact(&mut s, &mut out, info.size, &never, |done| {
+                        if last.elapsed() >= PROGRESS_INTERVAL || done == info.size {
+                            last = Instant::now();
+                            net.emit(NetEvent::UpdateProgress {
+                                done,
+                                total: info.size,
+                            });
+                        }
+                    })?;
+                    out.inner.flush()?;
+                    let got = secure::to_hex(&out.hasher.finalize());
+                    if got != info.sha256 {
+                        return Err(io::Error::other(
+                            "İndirilen program doğrulanamadı (özet tutmuyor)",
+                        ));
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    let _ = fs::remove_file(&part);
+                    return Err(e);
+                }
+                fs::rename(&part, &dest)?;
+                Ok(info.version)
+            })();
+            net.emit(match res {
+                Ok(version) => NetEvent::UpdateReady {
+                    path: dest,
+                    version,
+                },
+                Err(e) => NetEvent::UpdateFailed {
+                    error: match e.kind() {
+                        io::ErrorKind::PermissionDenied => {
+                            "Program klasörüne yazılamadı. LanChat'i kullanıcı klasörünüzde \
+                             (ör. Masaüstü) bir yerde çalıştırın."
+                                .into()
+                        }
+                        _ => friendly_error(&e, Side::Sender),
+                    },
+                },
+            });
         });
     }
 
@@ -1324,6 +1455,37 @@ fn unix_to_system_time(secs: i64) -> Option<SystemTime> {
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// Yazılan veriyi hem iletir hem SHA-256 özetine katar.
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut f = BufReader::new(File::open(path)?);
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(secure::to_hex(&h.finalize()))
 }
 
 fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
@@ -1905,6 +2067,38 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         fs::remove_dir_all(da).unwrap();
         fs::remove_dir_all(db).unwrap();
+    }
+
+    #[test]
+    fn update_is_served_only_to_paired_and_verified() {
+        let d = temp_dir("up");
+        let (a, _rx_a) = start("A", &d);
+        let (b, rx_b) = start("B", &d);
+        let addr_a: SocketAddr = ([127, 0, 0, 1], a.tcp_port()).into();
+
+        // Eşleşmemişken program verilmez
+        b.set_trusted(HashMap::from([("A".to_string(), a.public_key())]));
+        b.request_update(addr_a, "A".into(), d.join("guncelleme1"));
+        wait_for(&rx_b, |e| matches!(e, NetEvent::UpdateFailed { .. }));
+        assert!(!d.join("guncelleme1").exists());
+
+        // Eşleşince: indirilen dosya, A'nın çalışan programıyla birebir aynı
+        pair_up(&a, "A", &b, "B");
+        b.request_update(addr_a, "A".into(), d.join("guncelleme2"));
+        let ev = wait_for(&rx_b, |e| {
+            matches!(
+                e,
+                NetEvent::UpdateReady { .. } | NetEvent::UpdateFailed { .. }
+            )
+        });
+        let NetEvent::UpdateReady { path, version } = ev else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(version, protocol::APP_VERSION);
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(sha256_file(&path).unwrap(), sha256_file(&exe).unwrap());
+        assert!(!d.join("guncelleme2.part").exists());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

@@ -49,6 +49,40 @@ pub struct Beacon {
     pub name: String,
     /// Mesajların gönderileceği TCP portu.
     pub port: u16,
+    /// Uygulama sürümü (ör. "0.2.0"); eski sürümler göndermez
+    #[serde(default)]
+    pub ver: String,
+    /// Platform (ör. "windows-x86_64"); güncelleme yalnızca aynı platforma verilir
+    #[serde(default)]
+    pub plat: String,
+}
+
+/// Bu programın sürümü.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Bu programın platformu (işletim sistemi ve işlemci mimarisi).
+pub fn platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// "1.10.2" > "1.9.0" gibi sürüm karşılaştırması (sayısal).
+pub fn version_newer(candidate: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split('.')
+            .map(|p| p.trim().parse().unwrap_or(0))
+            .collect()
+    };
+    let (a, b) = (parse(candidate), parse(current));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    false
 }
 
 impl Beacon {
@@ -59,6 +93,8 @@ impl Beacon {
             id: id.into(),
             name: name.into(),
             port,
+            ver: APP_VERSION.into(),
+            plat: platform(),
         }
     }
 
@@ -89,6 +125,8 @@ pub enum Packet {
     },
     /// Gönderenin daha önce yolladığı bir mesajı iki taraftan da siler
     Delete { from: From, msg_id: String },
+    /// Karşı tarafın programını (güncelleme olarak) ister
+    GetUpdate { from: From },
     /// Eşleştirme isteği; alıcıda iki tarafın anahtarlarından türetilen kod gösterilir.
     PairRequest { from: From },
     /// Karşı taraf yazıyor (yanıt beklenmez)
@@ -115,6 +153,18 @@ pub struct ReplyRef {
     pub author: String,
     /// Mesajın ilk birkaç satırı ya da dosya adı
     pub preview: String,
+}
+
+/// `Packet::GetUpdate` yanıtı; `ok` ise ardından `size` bayt program gelir.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct UpdateInfo {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub version: String,
+    pub platform: String,
+    pub size: u64,
+    /// Programın SHA-256 özeti (hex)
+    pub sha256: String,
 }
 
 /// Alıcının `Packet::PairRequest`'e yanıtı.
@@ -320,6 +370,16 @@ mod tests {
             Beacon::parse(b"{\"app\":\"other\",\"v\":1,\"id\":\"x\",\"name\":\"n\",\"port\":1}")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn version_comparison() {
+        assert!(version_newer("0.2.0", "0.1.0"));
+        assert!(version_newer("1.10.0", "1.9.9"));
+        assert!(version_newer("1.0.1", "1.0"));
+        assert!(!version_newer("0.1.0", "0.1.0"));
+        assert!(!version_newer("0.1.0", "0.2.0"));
+        assert!(!version_newer("", "0.1.0"));
     }
 
     #[test]

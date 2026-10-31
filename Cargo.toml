@@ -1,6 +1,6 @@
 [package]
 name = "lanchat"
-version = "0.1.0"
+version = "0.2.0"
 description = "Aynı yerel ağdaki bilgisayarlar arasında mesaj ve dosya gönderme uygulaması"
 license = "MIT"
 edition = "2024"

@@ -3,6 +3,7 @@
 //! Komut satırı:
 //!   lanchat --hesap "Kamil – İş"   bu adlı hesabı açar (yoksa oluşturur)
 //!   lanchat --hesap-id <kimlik>    (uygulamanın kendi kullandığı) kimlikle açar
+//!   --guncelleme                   güncelleme sonrası: eski sürümün kapanmasını bekler
 
 use crate::app::{self, LanChatApp};
 use crate::storage::{self, LockedProfile, Profile, ProfileError, ProfileInfo, UnlockError};
@@ -103,7 +104,24 @@ impl Root {
         };
         match parse_cli() {
             Cli::Id(id) => match profiles.iter().find(|p| p.id == id) {
-                Some(p) => self.try_open(ctx, &p.clone()),
+                Some(p) => {
+                    let mut p = p.clone();
+                    if std::env::args().any(|a| a == "--guncelleme") {
+                        // Güncellemeden sonra: eski sürüm kapanıp hesabı bırakana kadar bekle
+                        let start = Instant::now();
+                        while p.in_use && start.elapsed() < Duration::from_secs(15) {
+                            std::thread::sleep(Duration::from_millis(200));
+                            if let Some(q) = storage::list_profiles(&self.root_dir)
+                                .into_iter()
+                                .find(|q| q.id == id)
+                            {
+                                p = q;
+                            }
+                        }
+                        self.picker.profiles = storage::list_profiles(&self.root_dir);
+                    }
+                    self.try_open(ctx, &p)
+                }
                 None => self.picker.message = Some("İstenen hesap bulunamadı".into()),
             },
             Cli::Name(name) => match find_name(&name) {
