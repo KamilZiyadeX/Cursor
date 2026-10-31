@@ -359,6 +359,7 @@ impl Root {
 
         let mut open: Option<ProfileInfo> = None;
         let mut create: Option<String> = None;
+        let mut restore = false;
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
@@ -421,11 +422,33 @@ impl Root {
                                 create = Some(self.picker.new_name.trim().to_string());
                             }
                         });
+                        ui.add_space(6.0);
+                        if ui
+                            .button("📥 Yedekten hesap geri yükle…")
+                            .on_hover_text(
+                                "Daha önce alınmış bir LanChat yedeğini bu bilgisayara ekler",
+                            )
+                            .clicked()
+                        {
+                            restore = true;
+                        }
                     });
                 },
             );
         });
 
+        if restore
+            && let Some(src) = rfd::FileDialog::new()
+                .set_title("Geri yüklenecek yedeği seçin")
+                .add_filter("LanChat yedeği", &[crate::backup::EXTENSION, "zip"])
+                .pick_file()
+        {
+            match crate::backup::restore_profile(&self.root_dir, &src) {
+                Ok(p) => self.try_open(&ctx, &p),
+                Err(e) => self.picker.message = Some(e),
+            }
+            self.picker.profiles = storage::list_profiles(&self.root_dir);
+        }
         if let Some(p) = open {
             self.try_open(&ctx, &p);
         } else if let Some(name) = create {

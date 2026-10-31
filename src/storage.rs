@@ -292,6 +292,14 @@ pub fn root_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("lanchat-data"))
 }
 
+/// Bir hesabın varsayılan indirme klasörü: `İndirilenler/LanChat (ad)`
+pub fn default_download_dir(account: &str) -> PathBuf {
+    downloads_base().join(format!(
+        "LanChat ({})",
+        crate::protocol::sanitize_file_name(account)
+    ))
+}
+
 fn downloads_base() -> PathBuf {
     directories::UserDirs::new()
         .and_then(|u| {

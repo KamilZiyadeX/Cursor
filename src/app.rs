@@ -1,5 +1,6 @@
 //! Masaüstü arayüzü (egui).
 
+use crate::backup;
 use crate::clip::{self, ClipContent};
 use crate::desktop::{self, DesktopEvent};
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
@@ -1809,6 +1810,93 @@ impl LanChatApp {
                 focused: false,
             });
         }
+        ui.separator();
+        if ui
+            .button("💾 Bu hesabı yedekle…")
+            .on_hover_text(
+                "Hesabın ayarlarını, anahtarını ve sohbet geçmişini tek bir dosyaya kaydeder. \
+                 Gelen dosyalar yedeğe girmez.",
+            )
+            .clicked()
+        {
+            ui.close();
+            self.backup_account();
+        }
+        if ui
+            .button("📥 Yedekten hesap geri yükle…")
+            .on_hover_text(
+                "Başka bir bilgisayarda ya da daha önce alınmış yedeği bu bilgisayara ekler",
+            )
+            .clicked()
+        {
+            ui.close();
+            self.restore_account();
+        }
+    }
+
+    fn backup_account(&mut self) {
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title("Hesap yedeğini kaydet")
+            .set_file_name(backup::backup_file_name(&self.cfg.name))
+            .add_filter("LanChat yedeği", &[backup::EXTENSION])
+            .save_file()
+        else {
+            return;
+        };
+        self.save_history();
+        let _ = self.cfg.save(&self.data_dir);
+        match backup::backup_profile(&self.data_dir, &dest) {
+            Ok(()) => self.show_toast(if self.profile.has_password() {
+                "Yedek kaydedildi (sohbet geçmişi ve anahtar, hesap şifrenizle şifreli)"
+            } else {
+                "Yedek kaydedildi. Hesabın gizli anahtarını içerir; güvenli bir yerde saklayın."
+            }),
+            Err(e) => self.show_toast(format!("Yedek kaydedilemedi: {e}")),
+        }
+    }
+
+    fn restore_account(&mut self) {
+        let Some(src) = rfd::FileDialog::new()
+            .set_title("Geri yüklenecek yedeği seçin")
+            .add_filter("LanChat yedeği", &[backup::EXTENSION, "zip"])
+            .pick_file()
+        else {
+            return;
+        };
+        match backup::restore_profile(&self.root_dir, &src) {
+            Ok(p) => {
+                self.show_toast(format!(
+                    "“{}” hesabı geri yüklendi; yeni pencerede açılıyor",
+                    p.name
+                ));
+                if let Err(e) = open_account_window(&p.id) {
+                    self.show_toast(format!("Yeni pencere açılamadı: {e}"));
+                }
+            }
+            Err(e) => self.show_toast(e),
+        }
+    }
+
+    /// Seçili sohbeti HTML ya da metin dosyası olarak kaydeder.
+    fn export_chat(&mut self, chat: &str, title: &str) {
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title("Sohbeti dışa aktar")
+            .set_file_name(backup::export_file_name(title))
+            .add_filter("Web sayfası", &["html"])
+            .add_filter("Metin dosyası", &["txt"])
+            .save_file()
+        else {
+            return;
+        };
+        let msgs: Vec<&ChatMessage> = self.messages.iter().filter(|m| m.peer_id == chat).collect();
+        let peer_name = if chat == BROADCAST { "?" } else { title };
+        match backup::export_chat(&dest, title, &self.cfg.name, peer_name, &msgs) {
+            Ok(path) => {
+                self.show_toast(format!("Sohbet kaydedildi ({} mesaj)", msgs.len()));
+                reveal_path(&path);
+            }
+            Err(e) => self.show_toast(format!("Kaydedilemedi: {e}")),
+        }
     }
 
     fn new_account_window(&mut self, ctx: &egui::Context) {
@@ -2307,11 +2395,18 @@ impl LanChatApp {
 
         let mut pair_clicked = false;
         let mut toggle_search = false;
+        let mut export_clicked = false;
         egui::Panel::top("chat-header").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&name).strong().size(16.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.menu_button("⋯", |ui| {
+                        if ui.button("💾 Sohbeti dışa aktar…").on_hover_text("Bu sohbeti bir web sayfası (.html) ya da metin dosyası (.txt) olarak kaydeder").clicked() {
+                            ui.close();
+                            export_clicked = true;
+                        }
+                    });
                     if ui
                         .small_button("🔍")
                         .on_hover_text("Bu sohbette ara (Ctrl+F)")
@@ -2408,6 +2503,9 @@ impl LanChatApp {
             }
             ui.add_space(4.0);
         });
+        if export_clicked {
+            self.export_chat(&peer_id, &name);
+        }
         if toggle_search {
             if self.search.as_ref().is_some_and(|(p, _)| *p == peer_id) {
                 self.search = None;
