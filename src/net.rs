@@ -157,6 +157,9 @@ struct Inner {
     local_registry: Option<PathBuf>,
     /// Aynı bilgisayarda açık olan diğer hesaplar: kimlik -> açık anahtar
     local_keys: Mutex<HashMap<String, PublicKey>>,
+    /// Hesap kapatıldı mı? Kaydı yazmak ve silmek bu kilit altında yapılır;
+    /// böylece kapatıldıktan sonra kayıt yeniden yazılamaz.
+    registry_stopped: Mutex<bool>,
     identity: Identity,
     trusted: RwLock<HashMap<String, PublicKey>>,
 }
@@ -233,6 +236,7 @@ impl Net {
                 active: Mutex::new(HashMap::new()),
                 local_registry: opts.local_registry,
                 local_keys: Mutex::new(HashMap::new()),
+                registry_stopped: Mutex::new(false),
                 identity: opts.identity,
                 trusted: RwLock::new(opts.trusted),
             }),
@@ -367,6 +371,8 @@ impl Net {
 
     /// Uygulama kapanırken çağrılır: bu hesabın yerel kaydını siler.
     pub fn shutdown(&self) {
+        let mut stopped = self.inner.registry_stopped.lock().unwrap();
+        *stopped = true;
         if let Some(dir) = &self.inner.local_registry {
             let _ = fs::remove_file(dir.join(format!("{}.json", self.inner.my_id)));
         }
@@ -391,14 +397,21 @@ impl Net {
                 ts: now,
                 public_key: secure::to_hex(&self.inner.identity.public),
             };
-            if let Ok(json) = serde_json::to_vec(&entry) {
-                let tmp = own.with_extension("tmp");
-                if fs::write(&tmp, json).is_ok() {
-                    let _ = fs::rename(&tmp, &own);
+            {
+                let stopped = self.inner.registry_stopped.lock().unwrap();
+                if *stopped {
+                    return;
+                }
+                if let Ok(json) = serde_json::to_vec(&entry) {
+                    let tmp = own.with_extension("tmp");
+                    if fs::write(&tmp, json).is_ok() {
+                        let _ = fs::rename(&tmp, &own);
+                    }
                 }
             }
 
             let mut seen = HashMap::new();
+            let mut found = Vec::new();
             for e in fs::read_dir(&dir)
                 .into_iter()
                 .flatten()
@@ -428,6 +441,12 @@ impl Net {
                     continue;
                 };
                 seen.insert(other.id.clone(), key);
+                found.push(other);
+            }
+            // Önce anahtarları kaydet, sonra arayüze bildir: kişi listede görünür
+            // görünmez mesaj gönderilirse kimlik doğrulaması hazır olsun.
+            *self.inner.local_keys.lock().unwrap() = seen;
+            for other in found {
                 self.emit(NetEvent::PeerSeen {
                     id: other.id,
                     name: other.name,
@@ -435,7 +454,6 @@ impl Net {
                     local: true,
                 });
             }
-            *self.inner.local_keys.lock().unwrap() = seen;
             thread::sleep(Duration::from_secs(2));
         }
     }
