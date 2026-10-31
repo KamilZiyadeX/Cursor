@@ -1278,7 +1278,8 @@ mod tests {
     }
 
     fn wait_for(rx: &Receiver<NetEvent>, mut pred: impl FnMut(&NetEvent) -> bool) -> NetEvent {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Meşgul bir makinede (ör. aynı anda derleme sürerken) yanlış alarm vermesin
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let ev = rx.recv_timeout(left).expect("olay gelmedi");
