@@ -1,5 +1,6 @@
 //! Masaüstü arayüzü (egui).
 
+use crate::clip::{self, ClipContent};
 use crate::desktop::{self, DesktopEvent};
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
 use crate::protocol::{self, ReplyRef};
@@ -154,6 +155,8 @@ pub struct LanChatApp {
     /// Kişi başına son "sıradakileri gönder" denemesi
     last_flush: HashMap<String, Instant>,
     last_queue_check: Instant,
+    /// Yapıştırılan resmin önizlemesi: (sohbet, resim, doku)
+    paste_preview: Option<(String, egui::ColorImage, egui::TextureHandle)>,
     /// Açık arama: (hangi sohbette, aranan metin)
     search: Option<(String, String)>,
     /// Arama kutusuna odaklanılsın mı (bir kerelik)
@@ -285,6 +288,7 @@ impl LanChatApp {
             outbox: history.outbox,
             last_flush: HashMap::new(),
             last_queue_check: Instant::now(),
+            paste_preview: None,
             search: None,
             search_focus: false,
             thumbs: HashMap::new(),
@@ -1066,6 +1070,101 @@ impl LanChatApp {
         }
         if offline > 0 {
             self.show_toast("Karşı taraf çevrimdışı; tepkiniz çevrimiçi olunca iletilecek");
+        }
+    }
+
+    /// Panodakini (dosyalar, resim ya da metin) seçili sohbete gönderir.
+    fn send_clipboard(&mut self, ctx: &egui::Context) {
+        if self.selected.is_none() {
+            self.show_toast("Önce soldan bir kişi seçin");
+            return;
+        }
+        match clip::read() {
+            Ok(ClipContent::Files(paths)) => self.send_paths(paths),
+            Ok(ClipContent::Image(img)) => self.preview_paste(ctx, img),
+            Ok(ClipContent::Text(text)) => {
+                // Yazılmakta olan mesaj kaybolmasın
+                let draft = std::mem::replace(&mut self.input, text);
+                let editing = self.editing.take();
+                self.send_text();
+                self.input = draft;
+                self.editing = editing;
+            }
+            Ok(ClipContent::Empty) => self.show_toast("Pano boş"),
+            Err(e) => self.show_toast(e),
+        }
+    }
+
+    /// Yapıştırılan resmi göndermeden önce gösterir.
+    fn preview_paste(&mut self, ctx: &egui::Context, img: egui::ColorImage) {
+        let Some(chat) = self.selected.clone() else {
+            return;
+        };
+        if chat != BROADCAST && !self.is_paired(&chat) {
+            self.show_toast("Önce bu kişiyle eşleşmelisiniz");
+            return;
+        }
+        let tex = ctx.load_texture(
+            "yapistirilan-resim",
+            img.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.paste_preview = Some((chat, img, tex));
+    }
+
+    fn paste_preview_window(&mut self, ctx: &egui::Context) {
+        let Some((chat, _, tex)) = &self.paste_preview else {
+            return;
+        };
+        let to = if chat == BROADCAST {
+            "📢 Herkese".to_string()
+        } else {
+            self.peer(chat).map(|p| p.name.clone()).unwrap_or_default()
+        };
+        let mut send = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        let mut cancel = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        egui::Window::new("Resmi gönder")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("Panodaki resim “{to}” sohbetine gönderilsin mi?"));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Image::new(tex)
+                        .max_size(egui::vec2(460.0, 320.0))
+                        .corner_radius(6),
+                );
+                let [w, h] = tex.size();
+                ui.label(RichText::new(format!("{w} × {h} piksel")).small().weak());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Gönder").strong()).clicked() {
+                        send = true;
+                    }
+                    if ui.button("Vazgeç").clicked() {
+                        cancel = true;
+                    }
+                    ui.label(RichText::new("Enter: gönder · Esc: vazgeç").small().weak());
+                });
+            });
+        if cancel {
+            self.paste_preview = None;
+        } else if send {
+            let Some((chat, img, _)) = self.paste_preview.take() else {
+                return;
+            };
+            let dir = self.cfg.download_dir.join("Gönderilen ekran görüntüleri");
+            match clip::save_png(&img, &dir) {
+                Ok(path) => {
+                    let prev = self.selected.replace(chat);
+                    self.send_paths(vec![path]);
+                    if self.selected != prev {
+                        self.selected = prev;
+                    }
+                }
+                Err(e) => self.show_toast(format!("Resim kaydedilemedi: {e}")),
+            }
         }
     }
 
@@ -2107,6 +2206,19 @@ impl LanChatApp {
                     picked = rfd::FileDialog::new()
                         .set_title("Gönderilecek klasörleri seçin")
                         .pick_folders();
+                }
+                ui.separator();
+                if ui
+                    .button("📋  Panodakini gönder   Ctrl+Shift+V")
+                    .on_hover_text(
+                        "Dosya Gezgini'nde kopyaladığınız dosyaları, ekran görüntüsünü ya da \
+                         kopyaladığınız metni gönderir",
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    let ctx = ui.ctx().clone();
+                    self.send_clipboard(&ctx);
                 }
             })
             .response
@@ -3324,6 +3436,27 @@ impl eframe::App for LanChatApp {
         });
         if !dropped.is_empty() {
             self.send_paths(dropped);
+        }
+
+        // Ctrl+V ile yapıştırılan resim (ör. ekran görüntüsü): önce önizleme
+        let pasted = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::PasteImage(img) => Some((**img).clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = pasted
+            && self.settings.is_none()
+        {
+            self.preview_paste(&ctx, img);
+        }
+        if self.settings.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::V))
+        {
+            self.send_clipboard(&ctx);
+        }
+        if self.paste_preview.is_some() {
+            self.paste_preview_window(&ctx);
         }
 
         egui::Panel::top("top").show(ui, |ui| {
