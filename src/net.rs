@@ -3,14 +3,15 @@
 //! Tüm ağ işleri arka plan iş parçacıklarında yürür; sonuçlar arayüze
 //! `NetEvent` olarak bir kanal üzerinden iletilir.
 
-use crate::protocol::{self, ACK_ERR, ACK_OK, Accept, Beacon, Entry, Packet};
+use crate::protocol::{
+    self, ACK_ERR, ACK_OK, ACK_UNPAIRED, Accept, Beacon, Entry, Packet, PairReply,
+};
+use crate::secure::{self, Identity, PublicKey, SecureStream};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{
-    IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -24,6 +25,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// Aktarım sonundaki onay için (alıcı büyük dosyaları diske yazarken bekleyebilir)
 const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(600);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+/// Eşleştirme isteğinin karşı tarafta onay bekleme süresi
+const PAIR_TIMEOUT: Duration = Duration::from_secs(180);
 /// Alıcıda boş alan hesabına eklenen pay
 const SPACE_MARGIN: u64 = 256 * 1024 * 1024;
 /// Bu kadar eski yarım aktarımlar açılışta silinir
@@ -35,6 +38,35 @@ pub enum NetEvent {
         id: String,
         name: String,
         addr: SocketAddr,
+        /// Aynı bilgisayardaki (bu Windows kullanıcısının) başka bir hesap
+        local: bool,
+    },
+    /// Eşleştirme başlattık; el sıkışma bitti ve kod belli oldu.
+    PairCode {
+        peer_id: String,
+        code: String,
+    },
+    /// Karşı taraf eşleştirmeyi onayladı ya da reddetti.
+    PairResult {
+        peer_id: String,
+        accepted: bool,
+        public_key: PublicKey,
+    },
+    PairFailed {
+        peer_id: String,
+        error: String,
+    },
+    /// Biri bizimle eşleşmek istiyor; yanıt `reply` ile verilir.
+    IncomingPair {
+        from: protocol::From,
+        addr: SocketAddr,
+        code: String,
+        public_key: PublicKey,
+        reply: Sender<bool>,
+    },
+    /// Kullanıcıya gösterilecek bilgi
+    Notice {
+        text: String,
     },
     IncomingText {
         from: protocol::From,
@@ -84,6 +116,10 @@ pub struct NetOptions {
     /// Her hesap buraya adını ve portunu yazar; böylece aynı bilgisayardaki
     /// hesaplar ağ yayınına güvenmeden birbirini bulur.
     pub local_registry: Option<PathBuf>,
+    /// Bu hesabın anahtar çifti
+    pub identity: Identity,
+    /// Eşleşilmiş cihazlar: hesap kimliği -> açık anahtar
+    pub trusted: HashMap<String, PublicKey>,
 }
 
 /// Aynı bilgisayardaki bir hesabın `local_registry` kaydı.
@@ -94,6 +130,10 @@ struct LocalRegistryEntry {
     port: u16,
     /// Son güncelleme (Unix saniyesi)
     ts: i64,
+    /// Hesabın açık anahtarı (hex). Aynı Windows kullanıcısının hesapları
+    /// birbirine eşleştirmesiz güvenir.
+    #[serde(default)]
+    public_key: String,
 }
 
 /// Arayüzün ağla konuştuğu tutamaç. Klonlanabilir.
@@ -115,8 +155,10 @@ struct Inner {
     /// Sürmekte olan aktarımların iptal işaretleri
     active: Mutex<HashMap<String, Arc<AtomicBool>>>,
     local_registry: Option<PathBuf>,
-    /// Aynı bilgisayarda açık olan diğer hesapların kimlikleri
-    local_ids: Mutex<HashSet<String>>,
+    /// Aynı bilgisayarda açık olan diğer hesaplar: kimlik -> açık anahtar
+    local_keys: Mutex<HashMap<String, PublicKey>>,
+    identity: Identity,
+    trusted: RwLock<HashMap<String, PublicKey>>,
 }
 
 /// Gönderilecek bir öğe.
@@ -190,7 +232,9 @@ impl Net {
                 discovery_error,
                 active: Mutex::new(HashMap::new()),
                 local_registry: opts.local_registry,
-                local_ids: Mutex::new(HashSet::new()),
+                local_keys: Mutex::new(HashMap::new()),
+                identity: opts.identity,
+                trusted: RwLock::new(opts.trusted),
             }),
         };
 
@@ -247,6 +291,51 @@ impl Net {
         self.inner.unicast_targets.lock().unwrap().insert(ip);
     }
 
+    /// Eşleşilmiş cihaz listesini günceller.
+    pub fn set_trusted(&self, trusted: HashMap<String, PublicKey>) {
+        *self.inner.trusted.write().unwrap() = trusted;
+    }
+
+    #[cfg(test)]
+    pub fn public_key(&self) -> PublicKey {
+        self.inner.identity.public
+    }
+
+    /// Bu kişiye bağlanırken karşıda görmeyi beklediğimiz anahtar.
+    fn expected_key(&self, peer_id: &str) -> Option<PublicKey> {
+        if let Some(k) = self.inner.trusted.read().unwrap().get(peer_id) {
+            return Some(*k);
+        }
+        self.inner.local_keys.lock().unwrap().get(peer_id).copied()
+    }
+
+    /// Bu kimlik, bu anahtarla bize mesaj/dosya gönderebilir mi?
+    fn is_authorized(&self, id: &str, key: &PublicKey) -> bool {
+        self.expected_key(id).is_some_and(|k| &k == key)
+    }
+
+    /// Şifreli bağlantı açar. `expect` verilirse karşı tarafın anahtarının
+    /// o kişinin eşleştirmede kaydedilen anahtarı olduğunu doğrular.
+    fn secure_connect(&self, addr: SocketAddr, expect: Option<&str>) -> io::Result<SecureStream> {
+        let expected = match expect {
+            Some(peer_id) => Some(self.expected_key(peer_id).ok_or_else(|| {
+                io::Error::other("Bu kişiyle henüz eşleşmediniz. Önce “🔑 Eşleştir”e basın.")
+            })?),
+            None => None,
+        };
+        let mut tcp = connect(addr)?;
+        protocol::write_magic(&mut tcp)?;
+        let s = SecureStream::client(tcp, &self.inner.identity)?;
+        if let Some(k) = expected
+            && s.remote_key() != &k
+        {
+            return Err(io::Error::other(
+                "Karşı bilgisayarın kimliği doğrulanamadı (anahtarı değişmiş). Yeniden eşleştirin.",
+            ));
+        }
+        Ok(s)
+    }
+
     /// Sürmekte olan bir aktarımı (gönderme ya da alma) durdurur.
     pub fn cancel(&self, msg_id: &str) {
         if let Some(flag) = self.inner.active.lock().unwrap().get(msg_id) {
@@ -300,6 +389,7 @@ impl Net {
                 name: self.inner.name.read().unwrap().clone(),
                 port: self.inner.tcp_port,
                 ts: now,
+                public_key: secure::to_hex(&self.inner.identity.public),
             };
             if let Ok(json) = serde_json::to_vec(&entry) {
                 let tmp = own.with_extension("tmp");
@@ -308,7 +398,7 @@ impl Net {
                 }
             }
 
-            let mut seen = HashSet::new();
+            let mut seen = HashMap::new();
             for e in fs::read_dir(&dir)
                 .into_iter()
                 .flatten()
@@ -334,14 +424,18 @@ impl Net {
                 if other.id == self.inner.my_id {
                     continue;
                 }
-                seen.insert(other.id.clone());
+                let Some(key) = secure::from_hex(&other.public_key) else {
+                    continue;
+                };
+                seen.insert(other.id.clone(), key);
                 self.emit(NetEvent::PeerSeen {
                     id: other.id,
                     name: other.name,
                     addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), other.port),
+                    local: true,
                 });
             }
-            *self.inner.local_ids.lock().unwrap() = seen;
+            *self.inner.local_keys.lock().unwrap() = seen;
             thread::sleep(Duration::from_secs(2));
         }
     }
@@ -385,7 +479,8 @@ impl Net {
             let Some(b) = Beacon::parse(&buf[..n]) else {
                 continue;
             };
-            if b.id == self.inner.my_id || self.inner.local_ids.lock().unwrap().contains(&b.id) {
+            if b.id == self.inner.my_id || self.inner.local_keys.lock().unwrap().contains_key(&b.id)
+            {
                 continue;
             }
             // Karşı tarafa da doğrudan duyuru gönder: yayın tek yönlü
@@ -395,6 +490,7 @@ impl Net {
                 id: b.id,
                 name: b.name,
                 addr: SocketAddr::new(src.ip(), b.port),
+                local: false,
             });
         }
     }
@@ -411,22 +507,57 @@ impl Net {
         }
     }
 
-    fn handle_conn(&self, mut stream: TcpStream) {
-        let Ok(peer) = stream.peer_addr() else { return };
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_nodelay(true);
-
-        let Ok(packet) = protocol::read_header(&mut stream) else {
+    fn handle_conn(&self, tcp: TcpStream) {
+        let Ok(peer) = tcp.peer_addr() else { return };
+        let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
+        let _ = tcp.set_nodelay(true);
+        let mut tcp = tcp;
+        if protocol::read_magic(&mut tcp).is_err() {
+            return;
+        }
+        let Ok(mut stream) = SecureStream::server(tcp, &self.inner.identity) else {
+            return;
+        };
+        let remote = *stream.remote_key();
+        let Ok(packet) = protocol::read_frame::<Packet>(&mut stream) else {
             return;
         };
         match packet {
+            Packet::PairRequest { from } => {
+                if from.id == self.inner.my_id {
+                    return;
+                }
+                let addr = SocketAddr::new(peer.ip(), from.port);
+                self.add_target(peer.ip());
+                let (tx, rx) = mpsc::channel();
+                self.emit(NetEvent::IncomingPair {
+                    from,
+                    addr,
+                    code: secure::pairing_code(&self.inner.identity.public, &remote),
+                    public_key: remote,
+                    reply: tx,
+                });
+                let accepted = rx.recv_timeout(PAIR_TIMEOUT).unwrap_or(false);
+                let _ = protocol::write_frame(
+                    &mut stream,
+                    &PairReply {
+                        accepted,
+                        from: self.me(),
+                    },
+                );
+            }
             Packet::Text { from, msg_id, text } => {
                 if from.id == self.inner.my_id {
                     return;
                 }
                 let addr = SocketAddr::new(peer.ip(), from.port);
                 self.add_target(peer.ip());
+                if !self.is_authorized(&from.id, &remote) {
+                    let _ = stream.write_all(&[ACK_UNPAIRED]);
+                    self.notify_unpaired(&from, addr);
+                    return;
+                }
                 self.emit(NetEvent::IncomingText {
                     from,
                     addr,
@@ -448,6 +579,17 @@ impl Net {
                 }
                 let addr = SocketAddr::new(peer.ip(), from.port);
                 self.add_target(peer.ip());
+                if !self.is_authorized(&from.id, &remote) {
+                    let _ = protocol::write_frame(
+                        &mut stream,
+                        &Accept {
+                            ok: false,
+                            error: Some("Alıcı sizi tanımıyor; önce eşleştirin".into()),
+                        },
+                    );
+                    self.notify_unpaired(&from, addr);
+                    return;
+                }
                 let name = protocol::sanitize_file_name(&name);
                 self.emit(NetEvent::IncomingTransfer {
                     from,
@@ -481,12 +623,29 @@ impl Net {
                 }
             }
         }
-        let _ = stream.shutdown(Shutdown::Both);
+        stream.shutdown();
+    }
+
+    /// Eşleşmediğimiz biri mesaj/dosya göndermeye çalıştı.
+    fn notify_unpaired(&self, from: &protocol::From, addr: SocketAddr) {
+        self.emit(NetEvent::PeerSeen {
+            id: from.id.clone(),
+            name: from.name.clone(),
+            addr,
+            local: false,
+        });
+        self.emit(NetEvent::Notice {
+            text: format!(
+                "“{}” size mesaj ya da dosya göndermeye çalıştı, ancak henüz eşleşmediniz. \
+                 Kişiyi seçip “🔑 Eşleştir”e basın.",
+                from.name
+            ),
+        });
     }
 
     fn receive_transfer(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut SecureStream,
         msg_id: &str,
         name: &str,
         is_dir: bool,
@@ -598,7 +757,47 @@ impl Net {
 
     /* ------------------------------ Gönderme ------------------------------ */
 
-    pub fn send_text(&self, addr: SocketAddr, msg_id: String, text: String) {
+    /// Eşleştirme isteği gönderir. Kod hemen `PairCode` ile, karşı tarafın
+    /// kararı `PairResult` (ya da `PairFailed`) ile bildirilir.
+    pub fn send_pair_request(&self, addr: SocketAddr, peer_id: String) {
+        let net = self.clone();
+        thread::spawn(move || {
+            let res = (|| -> io::Result<(PairReply, PublicKey)> {
+                let mut s = net.secure_connect(addr, None)?;
+                let remote = *s.remote_key();
+                net.emit(NetEvent::PairCode {
+                    peer_id: peer_id.clone(),
+                    code: secure::pairing_code(&net.inner.identity.public, &remote),
+                });
+                protocol::write_frame(&mut s, &Packet::PairRequest { from: net.me() })?;
+                s.set_read_timeout(Some(PAIR_TIMEOUT + Duration::from_secs(10)))?;
+                let reply: PairReply = protocol::read_frame(&mut s)?;
+                Ok((reply, remote))
+            })();
+            net.emit(match res {
+                Ok((reply, key)) if reply.from.id == peer_id => NetEvent::PairResult {
+                    peer_id,
+                    accepted: reply.accepted,
+                    public_key: key,
+                },
+                Ok(_) => NetEvent::PairFailed {
+                    peer_id,
+                    error: "Yanıt beklenen kişiden gelmedi".into(),
+                },
+                Err(e) => NetEvent::PairFailed {
+                    peer_id,
+                    error: match e.kind() {
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                            "Karşı taraf zamanında yanıt vermedi".into()
+                        }
+                        _ => friendly_error(&e, Side::Sender),
+                    },
+                },
+            });
+        });
+    }
+
+    pub fn send_text(&self, addr: SocketAddr, peer_id: String, msg_id: String, text: String) {
         let net = self.clone();
         thread::spawn(move || {
             let packet = Packet::Text {
@@ -607,8 +806,8 @@ impl Net {
                 text,
             };
             let res = (|| {
-                let mut s = connect(addr)?;
-                protocol::write_header(&mut s, &packet)?;
+                let mut s = net.secure_connect(addr, Some(&peer_id))?;
+                protocol::write_frame(&mut s, &packet)?;
                 s.flush()?;
                 read_ack(&mut s)
             })();
@@ -628,11 +827,11 @@ impl Net {
 
     /// Bir dosyayı ya da klasörü (içindekilerle birlikte) gönderir.
     /// Aynı `msg_id` ile yeniden çağrılırsa alıcı kaldığı yerden devam eder.
-    pub fn send_path(&self, addr: SocketAddr, msg_id: String, path: PathBuf) {
+    pub fn send_path(&self, addr: SocketAddr, peer_id: String, msg_id: String, path: PathBuf) {
         let net = self.clone();
         thread::spawn(move || {
             let cancel = net.register(&msg_id);
-            let res = net.do_send(addr, &msg_id, &path, &cancel);
+            let res = net.do_send(addr, &peer_id, &msg_id, &path, &cancel);
             net.unregister(&msg_id, &cancel);
             net.emit(match res {
                 Ok(skipped) => NetEvent::Completed {
@@ -652,6 +851,7 @@ impl Net {
     fn do_send(
         &self,
         addr: SocketAddr,
+        peer_id: &str,
         msg_id: &str,
         path: &Path,
         cancel: &AtomicBool,
@@ -685,8 +885,8 @@ impl Net {
             file_count,
         });
 
-        let mut s = connect(addr)?;
-        protocol::write_header(
+        let mut s = self.secure_connect(addr, Some(peer_id))?;
+        protocol::write_frame(
             &mut s,
             &Packet::Transfer {
                 from: self.me(),
@@ -920,13 +1120,15 @@ fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
     Ok(s)
 }
 
-fn read_ack(s: &mut TcpStream) -> io::Result<()> {
+fn read_ack(s: &mut impl Read) -> io::Result<()> {
     let mut ack = [0u8; 1];
     s.read_exact(&mut ack)?;
-    if ack[0] == ACK_OK {
-        Ok(())
-    } else {
-        Err(io::Error::other("Karşı taraf aktarımı tamamlayamadı"))
+    match ack[0] {
+        ACK_OK => Ok(()),
+        ACK_UNPAIRED => Err(io::Error::other(
+            "Karşı taraf sizi tanımıyor (eşleşme yok ya da kaldırılmış). Yeniden eşleştirin.",
+        )),
+        _ => Err(io::Error::other("Karşı taraf aktarımı tamamlayamadı")),
     }
 }
 
@@ -1061,10 +1263,18 @@ mod tests {
                 discovery_port: 0,
                 manual_ips: vec![],
                 local_registry: None,
+                identity: Identity::generate(),
+                trusted: HashMap::new(),
             },
             || {},
         )
         .unwrap()
+    }
+
+    /// İki tarafı birbirine güvenen (eşleşmiş) hale getirir.
+    fn pair_up(a: &Net, a_id: &str, b: &Net, b_id: &str) {
+        a.set_trusted(HashMap::from([(b_id.to_string(), b.public_key())]));
+        b.set_trusted(HashMap::from([(a_id.to_string(), a.public_key())]));
     }
 
     fn wait_for(rx: &Receiver<NetEvent>, mut pred: impl FnMut(&NetEvent) -> bool) -> NetEvent {
@@ -1136,6 +1346,8 @@ mod tests {
                     discovery_port: 0,
                     manual_ips: vec![],
                     local_registry: Some(registry.clone()),
+                    identity: Identity::generate(),
+                    trusted: HashMap::new(),
                 },
                 || {},
             )
@@ -1145,20 +1357,33 @@ mod tests {
         let (b, rx_b) = open("kisisel");
         assert_ne!(a.tcp_port(), b.tcp_port());
 
-        let NetEvent::PeerSeen { id, name, addr } = wait_for(
+        let NetEvent::PeerSeen {
+            id,
+            name,
+            addr,
+            local,
+        } = wait_for(
             &rx_a,
             |e| matches!(e, NetEvent::PeerSeen { id, .. } if id == "kisisel"),
-        ) else {
+        )
+        else {
             unreachable!()
         };
         assert_eq!((id.as_str(), name.as_str()), ("kisisel", "Hesap kisisel"));
         assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], b.tcp_port())));
+        assert!(local);
         wait_for(
             &rx_b,
             |e| matches!(e, NetEvent::PeerSeen { id, .. } if id == "is"),
         );
 
-        a.send_text(addr, "m1".into(), "Aynı bilgisayardan selam".into());
+        // Aynı bilgisayardaki hesaplar eşleştirmesiz, ama şifreli konuşur
+        a.send_text(
+            addr,
+            "kisisel".into(),
+            "m1".into(),
+            "Aynı bilgisayardan selam".into(),
+        );
         wait_for(
             &rx_b,
             |e| matches!(e, NetEvent::IncomingText { text, .. } if text == "Aynı bilgisayardan selam"),
@@ -1169,6 +1394,157 @@ mod tests {
         b.shutdown();
         assert!(!registry.join("kisisel.json").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unpaired_sender_is_rejected() {
+        let da = temp_dir("ua");
+        let db = temp_dir("ub");
+        let (a, rx_a) = start("A", &da);
+        let (b, rx_b) = start("B", &db);
+        // A, B'ye güveniyor ama B, A'yı tanımıyor
+        a.set_trusted(HashMap::from([("B".to_string(), b.public_key())]));
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+
+        a.send_text(addr_b, "B".into(), "t".into(), "gizli".into());
+        let NetEvent::Failed { error, .. } = wait_for(
+            &rx_a,
+            |e| matches!(e, NetEvent::Failed { msg_id, .. } if msg_id == "t"),
+        ) else {
+            unreachable!()
+        };
+        assert!(error.contains("tanımıyor"), "{error}");
+        wait_for(&rx_b, |e| matches!(e, NetEvent::Notice { .. }));
+
+        let f = da.join("x.bin");
+        fs::write(&f, b"veri").unwrap();
+        a.send_path(addr_b, "B".into(), "f".into(), f);
+        wait_for(
+            &rx_a,
+            |e| matches!(e, NetEvent::Failed { msg_id, .. } if msg_id == "f"),
+        );
+        // Alıcıda hiçbir şey oluşmamalı
+        assert_eq!(fs::read_dir(&db).unwrap().count(), 0);
+        // B'nin olay akışında hiç gelen mesaj olmamalı
+        while let Ok(ev) = rx_b.try_recv() {
+            assert!(!matches!(
+                ev,
+                NetEvent::IncomingText { .. } | NetEvent::IncomingTransfer { .. }
+            ));
+        }
+        fs::remove_dir_all(da).unwrap();
+        fs::remove_dir_all(db).unwrap();
+    }
+
+    #[test]
+    fn sending_to_unpaired_peer_fails_without_connecting() {
+        let d = temp_dir("np");
+        let (a, rx) = start("A", &d);
+        a.send_text(
+            ([127, 0, 0, 1], 9).into(),
+            "kimse".into(),
+            "x".into(),
+            "selam".into(),
+        );
+        let NetEvent::Failed { error, .. } =
+            wait_for(&rx, |e| matches!(e, NetEvent::Failed { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(error.contains("eşleşmediniz"), "{error}");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn impersonation_is_detected_on_both_sides() {
+        let d = temp_dir("imp");
+        let (a, _rx_a) = start("A", &d);
+        let (b, rx_b) = start("B", &d);
+        let (mallory, rx_m) = start("A", &d); // A gibi davranıyor ama anahtarı farklı
+        pair_up(&a, "A", &b, "B");
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+
+        // 1) Sahte "A", B'ye yazamaz
+        mallory.set_trusted(HashMap::from([("B".to_string(), b.public_key())]));
+        mallory.send_text(addr_b, "B".into(), "m".into(), "ben A'yım".into());
+        wait_for(
+            &rx_m,
+            |e| matches!(e, NetEvent::Failed { msg_id, .. } if msg_id == "m"),
+        );
+        while let Ok(ev) = rx_b.try_recv() {
+            assert!(!matches!(ev, NetEvent::IncomingText { .. }));
+        }
+
+        // 2) B'ye gönderdiğini sanan biri, aslında sahte adrese bağlanırsa fark eder
+        let (c, rx_c) = start("C", &d);
+        c.set_trusted(HashMap::from([("B".to_string(), b.public_key())]));
+        let mallory_addr: SocketAddr = ([127, 0, 0, 1], mallory.tcp_port()).into();
+        c.send_text(mallory_addr, "B".into(), "x".into(), "B'ye özel".into());
+        let NetEvent::Failed { error, .. } = wait_for(
+            &rx_c,
+            |e| matches!(e, NetEvent::Failed { msg_id, .. } if msg_id == "x"),
+        ) else {
+            unreachable!()
+        };
+        assert!(error.contains("doğrulanamadı"), "{error}");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn pairing_shows_same_code_and_exchanges_keys() {
+        let d = temp_dir("pair");
+        let (a, rx_a) = start("A", &d);
+        let (b, rx_b) = start("B", &d);
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+
+        a.send_pair_request(addr_b, "B".into());
+        let NetEvent::PairCode { code: code_a, .. } =
+            wait_for(&rx_a, |e| matches!(e, NetEvent::PairCode { .. }))
+        else {
+            unreachable!()
+        };
+        let NetEvent::IncomingPair {
+            from,
+            code: code_b,
+            public_key,
+            reply,
+            ..
+        } = wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingPair { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(code_a, code_b);
+        assert_eq!(from.id, "A");
+        assert_eq!(public_key, a.public_key());
+        reply.send(true).unwrap();
+
+        let NetEvent::PairResult {
+            peer_id,
+            accepted,
+            public_key,
+        } = wait_for(&rx_a, |e| matches!(e, NetEvent::PairResult { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(accepted);
+        assert_eq!(peer_id, "B");
+        assert_eq!(public_key, b.public_key());
+
+        // Reddedilen eşleştirme
+        a.send_pair_request(addr_b, "B".into());
+        let NetEvent::IncomingPair { reply, .. } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingPair { .. }))
+        else {
+            unreachable!()
+        };
+        reply.send(false).unwrap();
+        let NetEvent::PairResult { accepted, .. } =
+            wait_for(&rx_a, |e| matches!(e, NetEvent::PairResult { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(!accepted);
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1187,9 +1563,10 @@ mod tests {
         let db = temp_dir("b");
         let (a, rx_a) = start("A", &da);
         let (b, rx_b) = start("B", &db);
+        pair_up(&a, "A", &b, "B");
         let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
 
-        a.send_text(addr_b, "t1".into(), "Merhaba ğüşıöç 👋".into());
+        a.send_text(addr_b, "B".into(), "t1".into(), "Merhaba ğüşıöç 👋".into());
         match wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingText { .. })) {
             NetEvent::IncomingText {
                 from,
@@ -1215,7 +1592,7 @@ mod tests {
             .enumerate()
         {
             let id = format!("f{i}");
-            a.send_path(addr_b, id.clone(), src.clone());
+            a.send_path(addr_b, "B".into(), id.clone(), src.clone());
             let NetEvent::Completed {
                 saved_path: Some(p),
                 ..
@@ -1245,6 +1622,7 @@ mod tests {
         let db = temp_dir("fb");
         let (a, rx_a) = start("A", &da);
         let (b, rx_b) = start("B", &db);
+        pair_up(&a, "A", &b, "B");
         let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
 
         let src = da.join("Fotoğraflar 2026");
@@ -1262,7 +1640,7 @@ mod tests {
             .set_modified(old)
             .unwrap();
 
-        a.send_path(addr_b, "dir1".into(), src.clone());
+        a.send_path(addr_b, "B".into(), "dir1".into(), src.clone());
         let scanned = wait_for(&rx_a, |e| matches!(e, NetEvent::Scanned { .. }));
         let NetEvent::Scanned {
             total_size,
@@ -1298,6 +1676,7 @@ mod tests {
         let db = temp_dir("rb");
         let (a, rx_a) = start("A", &da);
         let (b, rx_b) = start("B", &db);
+        pair_up(&a, "A", &b, "B");
         let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
 
         let src = da.join("Yedek");
@@ -1320,7 +1699,7 @@ mod tests {
             .unwrap();
         fs::write(part.join("alt/b.bin"), &second[..1_500_000]).unwrap();
 
-        a.send_path(addr_b, "res1".into(), src.clone());
+        a.send_path(addr_b, "B".into(), "res1".into(), src.clone());
         // İlk ilerleme bildirimi baştan değil, eldeki kısımdan başlamalı
         let NetEvent::Progress { done, .. } =
             wait_for(&rx_a, |e| matches!(e, NetEvent::Progress { .. }))
@@ -1351,6 +1730,7 @@ mod tests {
         let db = temp_dir("cb");
         let (a, rx_a) = start("A", &da);
         let (b, rx_b) = start("B", &db);
+        pair_up(&a, "A", &b, "B");
         let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
 
         let src = da.join("Arşiv");
@@ -1366,7 +1746,7 @@ mod tests {
         let total = 3 * (64u64 << 20);
 
         // Başlat ve ilk ilerleme bildiriminde iptal et
-        a.send_path(addr_b, "big".into(), src.clone());
+        a.send_path(addr_b, "B".into(), "big".into(), src.clone());
         wait_for(&rx_a, |e| matches!(e, NetEvent::Progress { .. }));
         a.cancel("big");
         let NetEvent::Failed { error, .. } = wait_for(
@@ -1385,7 +1765,7 @@ mod tests {
         assert!(part.exists() && have < total, "yarım kalmalıydı: {have}");
 
         // Devam et: kalan kısım gönderilir, sonuç birebir aynı olmalı
-        a.send_path(addr_b, "big".into(), src.clone());
+        a.send_path(addr_b, "B".into(), "big".into(), src.clone());
         let NetEvent::Completed {
             saved_path: Some(p),
             ..
@@ -1428,7 +1808,16 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        a.send_text(([127, 0, 0, 1], port).into(), "x".into(), "selam".into());
+        a.set_trusted(HashMap::from([(
+            "Z".to_string(),
+            Identity::generate().public,
+        )]));
+        a.send_text(
+            ([127, 0, 0, 1], port).into(),
+            "Z".into(),
+            "x".into(),
+            "selam".into(),
+        );
         wait_for(
             &rx,
             |e| matches!(e, NetEvent::Failed { msg_id, .. } if msg_id == "x"),

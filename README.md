@@ -3,6 +3,7 @@
 Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında **mesaj ve dosya gönderme** masaüstü uygulaması. Rust ile yazıldı.
 
 - Sunucu, hesap ya da internet bağlantısı gerekmez: her şey yerel ağın içinde kalır.
+- **Uçtan uca şifreli**: Tüm mesajlar ve dosyalar şifrelenir. Yalnızca eşleştirdiğiniz cihazlar size mesaj ve dosya gönderebilir.
 - Aynı ağdaki LanChat'ler birbirini **otomatik bulur**, birkaç saniye içinde kişi listesinde görünür.
 - **Mesajlar**: Enter gönderir, Shift+Enter yeni satır ekler. Mesaja sağ tıklayıp kopyalayabilirsiniz.
 - **Dosya ve klasörler**: 📎 → *Dosya gönder* / *Klasör gönder* ile seçin ya da pencereye sürükleyip bırakın. **Boyut ve dosya sayısı sınırı yoktur** (1 TB'lık bir klasör de gönderilebilir). Klasörler alt klasörleri, boş klasörleri ve dosyaların değiştirilme tarihleriyle birlikte aynen kopyalanır.
@@ -18,7 +19,10 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 
 1. Programı **her iki bilgisayarda da** açın (ör. evdeki ve işyerindeki).
 2. İlk açılışta bilgisayarın adı kullanılır. Sağ üstteki **⚙ Ayarlar**'dan anlaşılır bir ad verin (ör. “Kamil – Ofis”).
-3. Birkaç saniye içinde diğer bilgisayar soldaki **Kişiler** listesinde yeşil noktayla görünür. Ona tıklayın ve yazmaya başlayın.
+3. Birkaç saniye içinde diğer bilgisayar soldaki **Kişiler** listesinde yeşil noktayla görünür. Ona tıklayın.
+4. İlk seferde **🔑 Eşleştir**'e basın. İki bilgisayarın ekranında da 6 haneli bir kod çıkar. Kodlar aynıysa **iki tarafta da** “Kodlar aynı — Onayla”ya basın. Bundan sonra kişinin yanında 🔒 görünür ve yazışmaya başlayabilirsiniz. Eşleştirme bir kez yapılır.
+
+> Kodlar farklıysa onaylamayın: bu, araya biri girmeye çalışıyor demektir.
 
 ### Birden çok hesap
 
@@ -108,6 +112,7 @@ Kaynak kod düzeni:
 | `src/protocol.rs` | Paket biçimi, dosya adı temizleme           |
 | `src/storage.rs`  | Hesaplar, ayarlar ve sohbet geçmişinin kaydı |
 | `src/root.rs`     | Açılışta hesap seçimi                        |
+| `src/secure.rs`   | Şifreleme (Noise), anahtarlar, eşleştirme kodu |
 
 ### Veri klasörü
 
@@ -119,11 +124,14 @@ Her hesabın ayarları (`config.json`) ve sohbet geçmişi (`history.json`) bu k
 
 `LANCHAT_DATA_DIR` ortam değişkeniyle başka bir klasör, `LANCHAT_PORT` ile başka bir TCP portu kullanılabilir (aynı bilgisayarda iki kopya çalıştırıp denemek için kullanışlıdır).
 
-## Güvenlik notu
+## Güvenlik
 
-LanChat, güvendiğiniz bir ev / ofis ağı için tasarlandı:
+- **Şifreleme**: Her LanChat hesabının kendine ait bir anahtar çifti vardır. Her bağlantı [Noise](https://noiseprotocol.org) protokolüyle (`Noise_XX_25519_ChaChaPoly_BLAKE2s`; WireGuard ve WhatsApp'ın kullandığı çerçeve) başlar. Sonraki tüm mesajlar, dosya adları ve dosya içerikleri ChaCha20-Poly1305 ile şifrelenir ve değiştirilmeye karşı doğrulanır. Ağı dinleyen biri içeriği göremez ve değiştiremez.
+- **Eşleştirme**: Hangi cihaza güvenileceğini siz belirlersiniz. Eşleştirme kodu iki tarafın anahtarlarından türetilir; araya giren biri (ortadaki adam saldırısı) farklı kodlara yol açar. Eşleşilmiş cihazlar **⚙ Ayarlar → Eşleşilmiş cihazlar** bölümünde görünür ve oradan kaldırılabilir.
+- **Kimlik doğrulama**: Eşleşmemiş cihazlardan gelen mesaj ve dosyalar reddedilir (kullanıcıya bildirilir). Mesaj gönderirken de karşı tarafın anahtarı kontrol edilir; başka biri o kişinin yerine geçemez.
+- Aynı bilgisayardaki kendi hesaplarınız birbirine eşleştirmesiz güvenir (aralarındaki trafik yine şifrelidir).
+- Hız: Şifreleme saniyede yüzlerce MB işler; kablolu gigabit ağda bile hızı düşürmez.
+- Gizli anahtar hesabın veri klasöründe (`key.json`) durur. Bu klasör yalnızca sizin Windows kullanıcınıza açıktır.
+- Bu sürüm eski (şifresiz) sürümlerle konuşamaz; iki bilgisayarda da yeni sürümü kullanın.
 
-- Trafik **şifrelenmez**; aynı ağdaki biri paketleri dinleyebilir.
-- Aynı ağda LanChat çalıştıran herkes size mesaj ve dosya gönderebilir; gelen dosyalar otomatik kaydedilir (ama otomatik açılmaz).
-
-Aynı ağı tanımadığınız kişilerle paylaşıyorsanız (ör. bina genelinde ortak Wi‑Fi) bunu göz önünde bulundurun ve bilmediğiniz kişilerden gelen dosyaları açmayın.
+Gelen dosyalar otomatik kaydedilir ama otomatik açılmaz. Eşleştirdiğiniz kişiden bile beklemediğiniz bir dosya gelirse açmadan önce dikkatli olun.

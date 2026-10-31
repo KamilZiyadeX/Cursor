@@ -2,11 +2,15 @@
 //!
 //! * Keşif: Her uygulama birkaç saniyede bir UDP ile `Beacon` yayınlar.
 //! * Aktarım: Her mesaj / aktarım için yeni bir TCP bağlantısı açılır.
-//!   Bağlantı `"LCH2"` ile başlar, ardından uzunluk önekli JSON çerçeveler gelir
-//!   (u32 big-endian uzunluk + JSON).
+//!   Bağlantı düz metin `"LCH3"` ile başlar, ardından Noise el sıkışması gelir
+//!   (bkz. `secure.rs`). Bundan sonraki her şey şifrelidir: uzunluk önekli
+//!   JSON çerçeveler (u32 big-endian uzunluk + JSON) ve dosya baytları.
 //!
 //! Metin:
-//!   gönderen → `Packet::Text`,  alıcı → 1 bayt onay
+//!   gönderen → `Packet::Text`,  alıcı → 1 bayt onay (`ACK_*`)
+//!
+//! Eşleştirme:
+//!   gönderen → `Packet::PairRequest`,  alıcı (kullanıcı onaylayınca) → `PairReply`
 //!
 //! Dosya / klasör (kaldığı yerden devam edebilir):
 //!   gönderen → `Packet::Transfer`
@@ -25,14 +29,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const DISCOVERY_PORT: u16 = 47820;
 pub const DEFAULT_TCP_PORT: u16 = 47821;
 pub const APP_TAG: &str = "lanchat";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
-const MAGIC: &[u8; 4] = b"LCH2";
+const MAGIC: &[u8; 4] = b"LCH3";
 const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 const COPY_BUF: usize = 1024 * 1024;
 
 pub const ACK_OK: u8 = 0;
 pub const ACK_ERR: u8 = 1;
+/// Alıcı göndereni tanımıyor (eşleşme yok)
+pub const ACK_UNPAIRED: u8 = 2;
 
 /// Keşif için UDP ile gönderilen duyuru.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -78,6 +84,8 @@ pub enum Packet {
         msg_id: String,
         text: String,
     },
+    /// Eşleştirme isteği; alıcıda iki tarafın anahtarlarından türetilen kod gösterilir.
+    PairRequest { from: From },
     /// Tek dosya (`is_dir == false`) ya da klasör aktarımı.
     Transfer {
         from: From,
@@ -88,6 +96,13 @@ pub enum Packet {
         total_size: u64,
         file_count: u64,
     },
+}
+
+/// Alıcının `Packet::PairRequest`'e yanıtı.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PairReply {
+    pub accepted: bool,
+    pub from: From,
 }
 
 /// Alıcının `Packet::Transfer`'a yanıtı.
@@ -136,12 +151,12 @@ pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
     Ok(serde_json::from_slice(&buf)?)
 }
 
-pub fn write_header(w: &mut impl Write, p: &Packet) -> io::Result<()> {
-    w.write_all(MAGIC)?;
-    write_frame(w, p)
+/// Bağlantının başındaki (şifresiz) protokol işareti.
+pub fn write_magic(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(MAGIC)
 }
 
-pub fn read_header(r: &mut impl Read) -> io::Result<Packet> {
+pub fn read_magic(r: &mut impl Read) -> io::Result<()> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -150,7 +165,7 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Packet> {
             "geçersiz protokol (karşı taraftaki LanChat sürümü farklı olabilir)",
         ));
     }
-    read_frame(r)
+    Ok(())
 }
 
 pub fn write_u64(w: &mut impl Write, v: u64) -> io::Result<()> {
@@ -269,17 +284,19 @@ mod tests {
             file_count: 12345,
         };
         let mut buf = Vec::new();
-        write_header(&mut buf, &p).unwrap();
+        write_magic(&mut buf).unwrap();
+        write_frame(&mut buf, &p).unwrap();
         write_frame(&mut buf, &Entry::End).unwrap();
         let mut r = buf.as_slice();
-        assert_eq!(read_header(&mut r).unwrap(), p);
+        read_magic(&mut r).unwrap();
+        assert_eq!(read_frame::<Packet>(&mut r).unwrap(), p);
         assert_eq!(read_frame::<Entry>(&mut r).unwrap(), Entry::End);
     }
 
     #[test]
     fn rejects_garbage() {
-        assert!(read_header(&mut &b"HTTP/1.1 200"[..]).is_err());
-        assert!(read_header(&mut &b"LCH1\x00\x00\x00\x02{}"[..]).is_err());
+        assert!(read_magic(&mut &b"HTTP/1.1 200"[..]).is_err());
+        assert!(read_magic(&mut &b"LCH2"[..]).is_err());
         assert!(
             Beacon::parse(b"{\"app\":\"other\",\"v\":1,\"id\":\"x\",\"name\":\"n\",\"port\":1}")
                 .is_none()

@@ -5,6 +5,7 @@ mod app;
 mod net;
 mod protocol;
 mod root;
+mod secure;
 mod storage;
 
 use eframe::egui;

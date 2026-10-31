@@ -2,7 +2,10 @@
 
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
 use crate::protocol;
-use crate::storage::{self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Profile};
+use crate::secure::PublicKey;
+use crate::storage::{
+    self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Profile, TrustedPeer,
+};
 use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
@@ -11,7 +14,7 @@ use eframe::egui::{
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -23,6 +26,30 @@ struct Peer {
     name: String,
     addr: Option<SocketAddr>,
     last_seen: Option<Instant>,
+    /// Aynı bilgisayardaki (bu Windows kullanıcısının) başka bir hesap
+    local: bool,
+}
+
+/// Bizim başlattığımız eşleştirme
+struct OutPair {
+    peer_id: String,
+    name: String,
+    code: Option<String>,
+    /// Kullanıcı kodların aynı olduğunu onayladı mı?
+    confirmed: bool,
+    /// Karşı tarafın kararı ve anahtarı
+    remote: Option<(bool, PublicKey)>,
+    error: Option<String>,
+}
+
+/// Karşı tarafın başlattığı eşleştirme
+struct InPair {
+    from: protocol::From,
+    addr: SocketAddr,
+    code: String,
+    key: PublicKey,
+    reply: Sender<bool>,
+    since: Instant,
 }
 
 impl Peer {
@@ -41,6 +68,7 @@ struct Settings {
     name: String,
     download_dir: PathBuf,
     manual_ips: Vec<String>,
+    trusted: Vec<TrustedPeer>,
     new_ip: String,
     error: Option<String>,
 }
@@ -54,6 +82,8 @@ pub struct LanChatApp {
     /// Açık hesap; kilidi pencere kapanana kadar tutar
     _profile: Profile,
     new_account: Option<NewAccount>,
+    out_pair: Option<OutPair>,
+    in_pair: Option<InPair>,
     net: Option<Net>,
     rx: Option<Receiver<NetEvent>>,
     startup_error: Option<String>,
@@ -94,6 +124,8 @@ impl LanChatApp {
                 discovery_port: protocol::DISCOVERY_PORT,
                 manual_ips: cfg.manual_ips.iter().filter_map(|s| parse_ip(s)).collect(),
                 local_registry,
+                identity: profile.identity.clone(),
+                trusted: cfg.trusted_map(),
             },
             move || ctx.request_repaint(),
         );
@@ -110,6 +142,7 @@ impl LanChatApp {
                 name: p.name,
                 addr: p.addr,
                 last_seen: None,
+                local: false,
             })
             .collect();
         let selected = history.messages.last().map(|m| m.peer_id.clone());
@@ -120,6 +153,8 @@ impl LanChatApp {
             cfg,
             _profile: profile,
             new_account: None,
+            out_pair: None,
+            in_pair: None,
             net,
             rx,
             startup_error,
@@ -147,13 +182,17 @@ impl LanChatApp {
         self.peers.iter().find(|p| p.id == id)
     }
 
-    fn upsert_peer(&mut self, id: &str, name: &str, addr: SocketAddr) {
+    /// `local`: aynı bilgisayardaki başka bir hesap mı (None: bilinmiyor, değiştirme)
+    fn upsert_peer(&mut self, id: &str, name: &str, addr: SocketAddr, local: Option<bool>) {
         let changed = match self.peer_mut(id) {
             Some(p) => {
                 let changed = p.name != name || p.addr != Some(addr);
                 p.name = name.to_string();
                 p.addr = Some(addr);
                 p.last_seen = Some(Instant::now());
+                if let Some(l) = local {
+                    p.local = l;
+                }
                 changed
             }
             None => {
@@ -162,6 +201,7 @@ impl LanChatApp {
                     name: name.to_string(),
                     addr: Some(addr),
                     last_seen: Some(Instant::now()),
+                    local: local.unwrap_or(false),
                 });
                 if self.selected.is_none() {
                     self.selected = Some(id.to_string());
@@ -199,14 +239,76 @@ impl LanChatApp {
 
     fn handle_event(&mut self, ctx: &egui::Context, ev: NetEvent) {
         match ev {
-            NetEvent::PeerSeen { id, name, addr } => self.upsert_peer(&id, &name, addr),
+            NetEvent::PeerSeen {
+                id,
+                name,
+                addr,
+                local,
+            } => self.upsert_peer(&id, &name, addr, Some(local)),
+            NetEvent::PairCode { peer_id, code } => {
+                if let Some(op) = &mut self.out_pair
+                    && op.peer_id == peer_id
+                {
+                    op.code = Some(code);
+                }
+            }
+            NetEvent::PairResult {
+                peer_id,
+                accepted,
+                public_key,
+            } => {
+                if let Some(op) = &mut self.out_pair
+                    && op.peer_id == peer_id
+                {
+                    op.remote = Some((accepted, public_key));
+                    if !accepted {
+                        op.error = Some("Karşı taraf eşleştirmeyi reddetti".into());
+                    }
+                }
+                self.finish_out_pair();
+            }
+            NetEvent::PairFailed { peer_id, error } => {
+                if let Some(op) = &mut self.out_pair
+                    && op.peer_id == peer_id
+                {
+                    op.error = Some(error);
+                }
+            }
+            NetEvent::IncomingPair {
+                from,
+                addr,
+                code,
+                public_key,
+                reply,
+            } => {
+                if self.in_pair.is_some() {
+                    // Aynı anda tek istek
+                    let _ = reply.send(false);
+                } else {
+                    self.upsert_peer(&from.id, &from.name, addr, None);
+                    self.in_pair = Some(InPair {
+                        from,
+                        addr,
+                        code,
+                        key: public_key,
+                        reply,
+                        since: Instant::now(),
+                    });
+                    if !self.focused {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Critical,
+                        ));
+                    }
+                }
+            }
+            NetEvent::Notice { text } => self.show_toast(text),
             NetEvent::IncomingText {
                 from,
                 addr,
                 msg_id,
                 text,
             } => {
-                self.upsert_peer(&from.id, &from.name, addr);
+                self.upsert_peer(&from.id, &from.name, addr, None);
                 self.push_message(ChatMessage::new(
                     msg_id,
                     from.id.clone(),
@@ -225,7 +327,7 @@ impl LanChatApp {
                 total_size,
                 file_count,
             } => {
-                self.upsert_peer(&from.id, &from.name, addr);
+                self.upsert_peer(&from.id, &from.name, addr, None);
                 if let Some(m) = self.message_mut(&msg_id) {
                     // Yarım kalan aktarım kaldığı yerden devam ediyor
                     m.state = MsgState::Pending;
@@ -324,6 +426,52 @@ impl LanChatApp {
         self.last_save = Instant::now();
     }
 
+    /// Bu kişiyle şifreli ve kimliği doğrulanmış konuşabilir miyiz?
+    fn is_paired(&self, peer_id: &str) -> bool {
+        self.cfg.is_trusted(peer_id) || self.peer(peer_id).is_some_and(|p| p.local)
+    }
+
+    fn save_trusted(&mut self) {
+        if let Some(net) = &self.net {
+            net.set_trusted(self.cfg.trusted_map());
+        }
+        if let Err(e) = self.cfg.save(&self.data_dir) {
+            self.show_toast(format!("Ayarlar kaydedilemedi: {e}"));
+        }
+    }
+
+    fn start_pairing(&mut self, peer_id: &str) {
+        let Some(net) = self.net.clone() else { return };
+        let Some(p) = self.peer(peer_id) else { return };
+        let Some(addr) = p.addr else {
+            self.show_toast("Bu kişinin adresi bilinmiyor");
+            return;
+        };
+        self.out_pair = Some(OutPair {
+            peer_id: peer_id.to_string(),
+            name: p.name.clone(),
+            code: None,
+            confirmed: false,
+            remote: None,
+            error: None,
+        });
+        net.send_pair_request(addr, peer_id.to_string());
+    }
+
+    /// İki taraf da onayladıysa eşleşmeyi kaydeder.
+    fn finish_out_pair(&mut self) {
+        let Some(op) = &self.out_pair else { return };
+        if let (true, Some((true, key))) = (op.confirmed, op.remote) {
+            let (id, name) = (op.peer_id.clone(), op.name.clone());
+            self.cfg.add_trusted(&id, &name, &key);
+            self.save_trusted();
+            self.out_pair = None;
+            self.show_toast(format!(
+                "🔒 “{name}” ile eşleşildi; artık konuşmalarınız şifreli"
+            ));
+        }
+    }
+
     fn show_toast(&mut self, text: impl Into<String>) {
         self.toast = Some((text.into(), Instant::now()));
     }
@@ -335,6 +483,10 @@ impl LanChatApp {
             self.show_toast("Önce soldan bir kişi seçin");
             return None;
         };
+        if !self.is_paired(&peer_id) {
+            self.show_toast("Önce bu kişiyle eşleşmelisiniz: üstteki “🔑 Eşleştir”e basın");
+            return None;
+        }
         match self.peer(&peer_id).and_then(|p| p.addr) {
             Some(addr) => Some((peer_id, addr)),
             None => {
@@ -356,12 +508,12 @@ impl LanChatApp {
         let id = new_id();
         self.push_message(ChatMessage::new(
             id.clone(),
-            peer_id,
+            peer_id.clone(),
             true,
             Body::Text(text.clone()),
             MsgState::Pending,
         ));
-        net.send_text(addr, id, text);
+        net.send_text(addr, peer_id, id, text);
         self.input.clear();
     }
 
@@ -396,7 +548,7 @@ impl LanChatApp {
                 },
                 MsgState::Pending,
             ));
-            net.send_path(addr, id, path);
+            net.send_path(addr, peer_id.clone(), id, path);
         }
     }
 
@@ -417,8 +569,8 @@ impl LanChatApp {
             mm.speed.reset();
         }
         match m.body {
-            Body::Text(t) => net.send_text(addr, m.id, t),
-            Body::File { path: Some(p), .. } => net.send_path(addr, m.id, p),
+            Body::Text(t) => net.send_text(addr, m.peer_id, m.id, t),
+            Body::File { path: Some(p), .. } => net.send_path(addr, m.peer_id, m.id, p),
             Body::File { path: None, .. } => {}
         }
     }
@@ -437,6 +589,7 @@ impl LanChatApp {
                         name: self.cfg.name.clone(),
                         download_dir: self.cfg.download_dir.clone(),
                         manual_ips: self.cfg.manual_ips.clone(),
+                        trusted: self.cfg.trusted.clone(),
                         new_ip: String::new(),
                         error: None,
                     });
@@ -551,6 +704,142 @@ impl LanChatApp {
         }
     }
 
+    fn pairing_windows(&mut self, ctx: &egui::Context) {
+        // Bizim başlattığımız eşleştirme
+        if let Some(op) = &mut self.out_pair {
+            let mut confirm = false;
+            let mut close = false;
+            egui::Window::new("🔑 Eşleştirme")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.label(format!("“{}” ile eşleştiriliyor", op.name));
+                    ui.add_space(8.0);
+                    match (&op.code, &op.error) {
+                        (_, Some(e)) => {
+                            ui.colored_label(Color32::from_rgb(220, 38, 38), e);
+                        }
+                        (None, None) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Bağlanılıyor…");
+                            });
+                        }
+                        (Some(code), None) => {
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new(code).monospace().size(34.0).strong());
+                            });
+                            ui.add_space(6.0);
+                            ui.label(
+                                "Diğer bilgisayarın ekranında da bir kod göründü. \
+                                 İki kod aynıysa burada ve orada onaylayın.",
+                            );
+                            ui.add_space(6.0);
+                            match op.remote {
+                                Some((true, _)) => {
+                                    ui.colored_label(
+                                        Color32::from_rgb(34, 197, 94),
+                                        "✔ Karşı taraf onayladı",
+                                    );
+                                }
+                                _ => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new("Karşı tarafın onayı bekleniyor…").weak(),
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if op.error.is_none() && op.code.is_some() && !op.confirmed {
+                            if ui
+                                .button(RichText::new("Kodlar aynı — Onayla").strong())
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if ui.button("Kodlar farklı — İptal").clicked() {
+                                close = true;
+                            }
+                        } else if op.confirmed && op.error.is_none() {
+                            ui.label(RichText::new("Onayladınız.").weak());
+                            if ui.button("Kapat").clicked() {
+                                close = true;
+                            }
+                        } else if ui.button("Kapat").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if confirm {
+                op.confirmed = true;
+                self.finish_out_pair();
+            } else if close {
+                self.out_pair = None;
+            }
+        }
+
+        // Karşı tarafın başlattığı eşleştirme
+        if let Some(ip) = &self.in_pair {
+            let mut decision: Option<bool> = None;
+            if ip.since.elapsed() > Duration::from_secs(175) {
+                decision = Some(false);
+            }
+            egui::Window::new("🔑 Eşleştirme isteği")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.label(format!(
+                        "“{}” ({}) sizinle eşleşmek istiyor.",
+                        ip.from.name,
+                        ip.addr.ip()
+                    ));
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(&ip.code).monospace().size(34.0).strong());
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        "Diğer bilgisayarın ekranındaki kodla aynıysa onaylayın. \
+                         Aynı değilse ya da bu isteği siz başlatmadıysanız reddedin.",
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Kodlar aynı — Onayla").strong())
+                            .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                        if ui.button("Reddet").clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            if let Some(accept) = decision {
+                let ip = self.in_pair.take().unwrap();
+                let _ = ip.reply.send(accept);
+                if accept {
+                    self.cfg.add_trusted(&ip.from.id, &ip.from.name, &ip.key);
+                    self.save_trusted();
+                    self.selected = Some(ip.from.id.clone());
+                    self.show_toast(format!(
+                        "🔒 “{}” ile eşleşildi; artık konuşmalarınız şifreli",
+                        ip.from.name
+                    ));
+                }
+            }
+        }
+    }
+
     fn peer_list(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(RichText::new("Kişiler").strong());
@@ -584,6 +873,13 @@ impl LanChatApp {
                     0.0,
                     egui::TextFormat::simple(FontId::proportional(15.0), ui.visuals().text_color()),
                 );
+                if self.cfg.is_trusted(&p.id) || p.local {
+                    text.append(
+                        "  🔒",
+                        0.0,
+                        egui::TextFormat::simple(FontId::proportional(12.0), Color32::GRAY),
+                    );
+                }
                 if unread > 0 {
                     text.append(
                         &format!("  ({unread})"),
@@ -701,7 +997,10 @@ impl LanChatApp {
             .peer(&peer_id)
             .map(|p| (p.name.clone(), p.online()))
             .unwrap_or_else(|| ("?".into(), false));
+        let paired = self.is_paired(&peer_id);
+        let local = self.peer(&peer_id).is_some_and(|p| p.local);
 
+        let mut pair_clicked = false;
         egui::Panel::top("chat-header").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -712,11 +1011,68 @@ impl LanChatApp {
                     ("çevrimdışı", Color32::GRAY)
                 };
                 ui.label(RichText::new(txt).color(col).small());
+                if paired {
+                    let hover = if local {
+                        "Bu bilgisayardaki diğer hesabınız; mesajlar ve dosyalar şifreli gider"
+                    } else {
+                        "Eşleşilmiş cihaz; mesajlar ve dosyalar uçtan uca şifreli gider"
+                    };
+                    ui.label(
+                        RichText::new("🔒 şifreli")
+                            .small()
+                            .color(Color32::from_rgb(34, 197, 94)),
+                    )
+                    .on_hover_text(hover);
+                }
             });
             ui.add_space(4.0);
         });
 
-        egui::Panel::bottom("composer").show(ui, |ui| self.composer(ui));
+        if paired {
+            egui::Panel::bottom("composer").show(ui, |ui| self.composer(ui));
+        } else {
+            egui::Panel::bottom("pair-banner").show(ui, |ui| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🔑").size(22.0));
+                    // Düğmeye yer bırakıp metni kalan genişlikte sar
+                    let button_w = 120.0;
+                    let text_w = (ui.available_width() - button_w - 16.0).max(120.0);
+                    ui.allocate_ui(egui::vec2(text_w, 0.0), |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Bu kişiyle henüz eşleşmediniz").strong());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Mesaj ve dosya göndermek için bir kez eşleştirin. İki ekranda \
+                                         aynı kod görünecek; kodlar aynıysa iki tarafta da onaylayın.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                online,
+                                egui::Button::new(RichText::new("🔑 Eşleştir").strong()),
+                            )
+                            .on_disabled_hover_text("Kişi çevrimiçi olduğunda eşleştirebilirsiniz")
+                            .clicked()
+                        {
+                            pair_clicked = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+            });
+        }
+        if pair_clicked {
+            self.start_pairing(&peer_id);
+        }
 
         let mut actions: Vec<Action> = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
@@ -792,6 +1148,29 @@ impl LanChatApp {
                 });
                 ui.add_space(10.0);
 
+                ui.label(RichText::new("Eşleşilmiş cihazlar").strong());
+                ui.label(
+                    RichText::new("Yalnızca bu cihazlar size mesaj ve dosya gönderebilir. Kaldırırsanız yeniden eşleştirmeniz gerekir.")
+                        .small()
+                        .weak(),
+                );
+                if s.trusted.is_empty() {
+                    ui.label(RichText::new("Henüz eşleşilmiş cihaz yok").weak());
+                }
+                let mut remove_trusted = None;
+                for (i, t) in s.trusted.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("🔒 {}", t.name));
+                        if ui.small_button("✖").on_hover_text("Eşleşmeyi kaldır").clicked() {
+                            remove_trusted = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove_trusted {
+                    s.trusted.remove(i);
+                }
+                ui.add_space(10.0);
+
                 ui.label(RichText::new("Elle eklenen bilgisayarlar").strong());
                 ui.label(
                     RichText::new("Karşı bilgisayar otomatik görünmüyorsa IP adresini buraya ekleyin (karşı tarafta sol altta yazar).")
@@ -849,7 +1228,9 @@ impl LanChatApp {
             }
             self.cfg.download_dir = s.download_dir;
             self.cfg.manual_ips = s.manual_ips;
+            self.cfg.trusted = s.trusted;
             if let Some(net) = &self.net {
+                net.set_trusted(self.cfg.trusted_map());
                 net.set_name(&self.cfg.name);
                 net.set_download_dir(self.cfg.download_dir.clone());
                 for ip in self.cfg.manual_ips.iter().filter_map(|s| parse_ip(s)) {
@@ -889,7 +1270,8 @@ impl LanChatApp {
         }
 
         if let Some((text, at)) = &self.toast {
-            if at.elapsed() > Duration::from_millis(2500) {
+            let visible = Duration::from_millis(2500 + 40 * text.chars().count() as u64);
+            if at.elapsed() > visible {
                 self.toast = None;
             } else {
                 egui::Area::new(Id::unique("toast"))
@@ -1190,6 +1572,7 @@ impl eframe::App for LanChatApp {
 
         self.settings_window(&ctx);
         self.new_account_window(&ctx);
+        self.pairing_windows(&ctx);
         self.overlays(&ctx);
     }
 

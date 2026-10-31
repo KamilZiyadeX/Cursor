@@ -1,6 +1,8 @@
 //! Ayarlar ve sohbet geçmişinin diske kaydedilmesi.
 
+use crate::secure::{Identity, PublicKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -14,6 +16,17 @@ pub struct Config {
     pub download_dir: PathBuf,
     #[serde(default)]
     pub manual_ips: Vec<String>,
+    /// Eşleşilmiş cihazlar
+    #[serde(default)]
+    pub trusted: Vec<TrustedPeer>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TrustedPeer {
+    pub id: String,
+    pub name: String,
+    /// Açık anahtar (hex)
+    pub public_key: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -169,7 +182,29 @@ impl Config {
             name: name.to_string(),
             download_dir,
             manual_ips: Vec::new(),
+            trusted: Vec::new(),
         }
+    }
+
+    pub fn trusted_map(&self) -> HashMap<String, PublicKey> {
+        self.trusted
+            .iter()
+            .filter_map(|t| Some((t.id.clone(), crate::secure::from_hex(&t.public_key)?)))
+            .collect()
+    }
+
+    pub fn is_trusted(&self, id: &str) -> bool {
+        self.trusted.iter().any(|t| t.id == id)
+    }
+
+    /// Eşleştirilen cihazı ekler (aynı kimlik varsa anahtarını yeniler).
+    pub fn add_trusted(&mut self, id: &str, name: &str, key: &PublicKey) {
+        self.trusted.retain(|t| t.id != id);
+        self.trusted.push(TrustedPeer {
+            id: id.to_string(),
+            name: name.to_string(),
+            public_key: crate::secure::to_hex(key),
+        });
     }
 
     pub fn load(dir: &Path) -> io::Result<Config> {
@@ -204,6 +239,8 @@ pub struct ProfileInfo {
 pub struct Profile {
     pub dir: PathBuf,
     pub cfg: Config,
+    /// Hesabın şifreleme anahtarı
+    pub identity: Identity,
     _lock: fs::File,
 }
 
@@ -321,6 +358,7 @@ pub fn open_profile(dir: &Path) -> Result<Profile, ProfileError> {
         Ok(()) => Ok(Profile {
             dir: dir.to_path_buf(),
             cfg,
+            identity: Identity::load_or_create(dir).map_err(ProfileError::Io)?,
             _lock: lock,
         }),
         Err(fs::TryLockError::WouldBlock) => Err(ProfileError::InUse),
