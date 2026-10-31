@@ -1,5 +1,6 @@
 //! Masaüstü arayüzü (egui).
 
+use crate::desktop::{self, DesktopEvent};
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
 use crate::protocol::{self, ReplyRef};
 use crate::secure::PublicKey;
@@ -105,6 +106,9 @@ enum UpdateState {
 
 struct Settings {
     speed: net::SpeedLimit,
+    close_to_tray: bool,
+    notifications: bool,
+    autostart: bool,
     has_password: bool,
     pw_current: String,
     pw_new: String,
@@ -147,6 +151,17 @@ pub struct LanChatApp {
     update: UpdateState,
     /// "Daha sonra" denilen sürüm (bu oturumda yeniden sorulmaz)
     update_dismissed: Option<String>,
+    /// Sistem tepsisi simgesi (yalnızca Windows)
+    tray: Option<desktop::Tray>,
+    desk_tx: Sender<DesktopEvent>,
+    desk_rx: Receiver<DesktopEvent>,
+    /// Pencere tepsiye gizlendi mi?
+    hidden: bool,
+    /// Gerçekten kapatılıyor (tepsiye gizlenmeyecek)
+    quitting: bool,
+    /// Açılışta pencereyi gizle (Windows açılınca arka planda başlatma)
+    start_hidden: bool,
+    last_show_check: Instant,
     out_pair: Option<OutPair>,
     in_pair: Option<InPair>,
     net: Option<Net>,
@@ -168,7 +183,12 @@ pub struct LanChatApp {
 }
 
 impl LanChatApp {
-    pub fn new(ctx: &egui::Context, root_dir: PathBuf, profile: Profile) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        root_dir: PathBuf,
+        profile: Profile,
+        start_hidden: bool,
+    ) -> Self {
         let data_dir = profile.dir.clone();
         let cfg = profile.cfg.clone();
         let history = profile.load_history();
@@ -177,6 +197,18 @@ impl LanChatApp {
         let local_registry = Some(storage::online_dir(&root_dir));
         let logo = small_logo_texture(ctx);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let (desk_tx, desk_rx) = std::sync::mpsc::channel();
+        let tray = {
+            let ctx = ctx.clone();
+            desktop::Tray::new(
+                &format!("LanChat — {}", cfg.name),
+                desk_tx.clone(),
+                move || ctx.request_repaint(),
+            )
+        };
+        desktop::refresh_autostart(&cfg.id);
+        // Tepsi yoksa (ör. oluşturulamadıysa) pencereyi gizlemek onu kaybettirir
+        let start_hidden = start_hidden && tray.is_some();
         let ctx = ctx.clone();
         let tcp_port = std::env::var("LANCHAT_PORT")
             .ok()
@@ -233,6 +265,13 @@ impl LanChatApp {
             peer_versions: HashMap::new(),
             update: UpdateState::Idle,
             update_dismissed: None,
+            tray,
+            desk_tx,
+            desk_rx,
+            hidden: false,
+            quitting: false,
+            start_hidden,
+            last_show_check: Instant::now(),
             out_pair: None,
             in_pair: None,
             net,
@@ -305,15 +344,97 @@ impl LanChatApp {
         self.dirty = true;
     }
 
-    fn on_incoming(&mut self, ctx: &egui::Context, peer_id: &str) {
+    /// Yeni mesaj ya da dosya geldiğinde: okunmamış sayısı, görev çubuğu ve bildirim.
+    fn on_incoming(&mut self, ctx: &egui::Context, peer_id: &str, preview: &str) {
         let viewing = self.focused && self.selected.as_deref() == Some(peer_id);
         if !viewing {
             *self.unread.entry(peer_id.to_string()).or_default() += 1;
         }
         if !self.focused {
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                egui::UserAttentionType::Informational,
-            ));
+            if !self.hidden {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
+            if self.cfg.notifications {
+                let name = self
+                    .peer(peer_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "LanChat".into());
+                self.notify(ctx, &name, preview, Some(peer_id.to_string()));
+            }
+        }
+    }
+
+    fn notify(&self, ctx: &egui::Context, title: &str, body: &str, peer_id: Option<String>) {
+        let ctx = ctx.clone();
+        desktop::notify(
+            &self.root_dir,
+            title,
+            &desktop::preview(body),
+            peer_id,
+            self.desk_tx.clone(),
+            move || ctx.request_repaint(),
+        );
+    }
+
+    /// Pencereyi gösterir ve öne getirir.
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// Tepsi, bildirim, "öne gel" isteği ve pencere kapatma
+    fn desktop_logic(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.start_hidden) {
+            self.hide_window(ctx);
+        }
+        while let Ok(ev) = self.desk_rx.try_recv() {
+            match ev {
+                DesktopEvent::Show(peer) => {
+                    if let Some(id) = peer {
+                        self.unread.remove(&id);
+                        self.selected = Some(id);
+                    }
+                    self.show_window(ctx);
+                }
+                DesktopEvent::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if self.last_show_check.elapsed() >= Duration::from_millis(700) {
+            self.last_show_check = Instant::now();
+            if storage::take_show_request(&self.data_dir) {
+                self.show_window(ctx);
+            }
+        }
+        let close = ctx.input(|i| i.viewport().close_requested());
+        if close && !self.quitting && self.tray.is_some() && self.cfg.close_to_tray {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+            self.save_history();
+            if !self.cfg.tray_hint_shown {
+                self.cfg.tray_hint_shown = true;
+                let _ = self.cfg.save(&self.data_dir);
+                self.notify(
+                    ctx,
+                    "LanChat çalışmaya devam ediyor",
+                    "Mesaj ve dosyalar gelmeye devam eder. Açmak için saatin yanındaki \
+                     LanChat simgesine tıklayın; tamamen kapatmak için simgeye sağ tıklayıp \
+                     Çıkış'ı seçin.",
+                    None,
+                );
+            }
         }
     }
 
@@ -436,6 +557,7 @@ impl LanChatApp {
             } => {
                 self.upsert_peer(&from.id, &from.name, addr, None);
                 self.typing.remove(&from.id);
+                let preview = text.clone();
                 self.push_message(ChatMessage {
                     reply_to,
                     ..ChatMessage::new(
@@ -446,7 +568,7 @@ impl LanChatApp {
                         MsgState::Done,
                     )
                 });
-                self.on_incoming(ctx, &from.id);
+                self.on_incoming(ctx, &from.id, &preview);
             }
             NetEvent::IncomingTransfer {
                 from,
@@ -474,6 +596,17 @@ impl LanChatApp {
                     }
                     self.dirty = true;
                 } else {
+                    let preview = if is_dir {
+                        format!(
+                            "📁 {name} klasörünü gönderiyor ({})",
+                            format_bytes(total_size)
+                        )
+                    } else {
+                        format!(
+                            "📎 {name} dosyasını gönderiyor ({})",
+                            format_bytes(total_size)
+                        )
+                    };
                     self.push_message(ChatMessage::new(
                         msg_id,
                         from.id.clone(),
@@ -487,7 +620,7 @@ impl LanChatApp {
                         },
                         MsgState::Pending,
                     ));
-                    self.on_incoming(ctx, &from.id);
+                    self.on_incoming(ctx, &from.id, &preview);
                 }
             }
             NetEvent::Scanned {
@@ -969,6 +1102,9 @@ impl LanChatApp {
                 if ui.button("⚙ Ayarlar").clicked() {
                     self.settings = Some(Settings {
                         speed: self.cfg.speed_limit,
+                        close_to_tray: self.cfg.close_to_tray,
+                        notifications: self.cfg.notifications,
+                        autostart: desktop::autostart_enabled(&self.cfg.id),
                         has_password: self.profile.has_password(),
                         pw_current: String::new(),
                         pw_new: String::new(),
@@ -1118,7 +1254,10 @@ impl LanChatApp {
             update::restart(&exe, &self.cfg.id)
         });
         match result {
-            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Ok(()) => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Err(e) => {
                 self.update = UpdateState::Failed(format!("Kurulamadı: {e}"));
             }
@@ -1905,6 +2044,17 @@ impl LanChatApp {
                 );
                 ui.add_space(10.0);
 
+                if desktop::HAS_TRAY {
+                    ui.label(RichText::new("Masaüstü").strong());
+                    ui.checkbox(&mut s.autostart, "Windows açılınca bu hesabı arka planda başlat");
+                    ui.checkbox(
+                        &mut s.close_to_tray,
+                        "Pencere kapatılınca saatin yanındaki simgede çalışmaya devam et",
+                    );
+                    ui.checkbox(&mut s.notifications, "Yeni mesaj ve dosyalarda bildirim göster");
+                    ui.add_space(10.0);
+                }
+
                 ui.label(RichText::new("Hesap şifresi").strong());
                 let pw_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
                     ui.add(TextEdit::singleline(text).password(true).hint_text(hint).desired_width(260.0));
@@ -2052,6 +2202,18 @@ impl LanChatApp {
             self.cfg.manual_ips = s.manual_ips;
             self.cfg.trusted = s.trusted;
             self.cfg.speed_limit = s.speed;
+            self.cfg.close_to_tray = s.close_to_tray;
+            self.cfg.notifications = s.notifications;
+            if let Some(tray) = &self.tray {
+                tray.set_tooltip(&format!("LanChat — {}", self.cfg.name));
+            }
+            if desktop::HAS_TRAY
+                && s.autostart != desktop::autostart_enabled(&self.cfg.id)
+                && let Err(e) = desktop::set_autostart(&self.cfg.id, s.autostart)
+            {
+                self.show_toast(format!("Windows başlangıç ayarı değiştirilemedi: {e}"));
+                return;
+            }
             if let Some(net) = &self.net {
                 net.set_speed_limit(self.cfg.speed_limit);
                 net.set_trusted(self.cfg.trusted_map());
@@ -2476,7 +2638,8 @@ impl eframe::App for LanChatApp {
             self.rx = Some(rx);
         }
 
-        self.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        self.desktop_logic(ctx);
+        self.focused = !self.hidden && ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if self.focused
             && let Some(sel) = &self.selected
         {

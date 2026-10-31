@@ -9,13 +9,19 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 - Sunucu, hesap ya da internet bağlantısı gerekmez: her şey yerel ağın içinde kalır.
 - **Uçtan uca şifreli**: Tüm mesajlar ve dosyalar şifrelenir. Yalnızca eşleştirdiğiniz cihazlar size mesaj ve dosya gönderebilir.
 - Aynı ağdaki LanChat'ler birbirini **otomatik bulur**, birkaç saniye içinde kişi listesinde görünür.
-- **Mesajlar**: Enter gönderir, Shift+Enter yeni satır ekler. Mesaja sağ tıklayıp kopyalayabilirsiniz.
+- **Mesajlar**: Enter gönderir, Shift+Enter yeni satır ekler. Mesaja sağ tıklayınca **Yanıtla**, **Kopyala**, **Benden sil** ve **Herkesten sil** çıkar. Karşı taraf yazarken “yazıyor…”, mesajınızı okuduğunda mavi ✔✔ görünür.
+- **Arama**: Sohbetin sağ üstündeki 🔍 (ya da Ctrl+F) o sohbetteki mesajlarda ve dosya adlarında arar; Türkçe harflerde büyük/küçük ayrımı yapmaz.
+- **📢 Herkese**: Kişi listesinin en üstündeki bu sohbetten yazılan mesaj ve gönderilen dosyalar, o an çevrimiçi olan tüm eşleşmiş cihazlara gider.
+- **Resim önizleme**: Gönderilen ve gelen resimler (PNG, JPG, GIF, WebP, BMP) sohbette küçük resim olarak görünür.
 - **Dosya ve klasörler**: 📎 → *Dosya gönder* / *Klasör gönder* ile seçin ya da pencereye sürükleyip bırakın. **Boyut ve dosya sayısı sınırı yoktur** (1 TB'lık bir klasör de gönderilebilir). Klasörler alt klasörleri, boş klasörleri ve dosyaların değiştirilme tarihleriyle birlikte aynen kopyalanır.
 - **Kaldığı yerden devam**: Bağlantı koparsa, bilgisayar kapanırsa ya da **✖ İptal**'e basılırsa yarım kalan kısım silinmez. Gönderen **▶ Kaldığı yerden devam et** dediğinde tamamlanan dosyalar atlanır, yarım kalan dosya kaldığı bayttan sürer.
 - Aktarım sırasında **hız** ve **kalan süre** gösterilir. Alıcıda yeterli boş alan yoksa aktarım başlamadan reddedilir.
 - Gelen dosyalar `İndirilenler/LanChat` klasörüne kaydedilir (Ayarlar'dan değiştirilebilir). Her dosyanın yanında **Aç** ve **Klasörde göster** düğmeleri vardır.
 - **Birden çok hesap**: Aynı Windows oturumunda birden fazla LanChat hesabı (ör. “Kamil – İş” ve “Kamil – Kişisel”) aynı anda ayrı pencerelerde açık olabilir. Her hesabın kendi adı, sohbet geçmişi ve indirme klasörü vardır; aynı bilgisayardaki hesaplar birbirine de mesaj ve dosya gönderebilir.
-- Okunmamış mesaj sayısı ve görev çubuğunda yanıp sönme ile bildirim.
+- **Bildirimler ve arka planda çalışma** (Windows): Yeni mesaj ve dosyalarda Windows bildirimi çıkar. Pencere kapatılınca LanChat saatin yanındaki simgede çalışmaya devam eder; istenirse Windows açılınca kendiliğinden başlar.
+- **Hız sınırı**: Büyük aktarımlar ağı tıkamasın diye gönderme hızı sınırlanabilir (isterseniz yalnızca mesai saatlerinde).
+- **Ağdan güncelleme**: Eşleştiğiniz bir bilgisayarda daha yeni bir LanChat varsa tek tıkla ondan güncellenir; internetten bir şey indirmeye gerek kalmaz.
+- Okunmamış mesaj sayısı, pencere başlığında ve görev çubuğunda yanıp sönme ile gösterilir.
 - Sohbet geçmişi saklanır; uygulama kapatılıp açılınca kaybolmaz.
 - Windows, macOS ve Linux'ta çalışır. Tek dosyadır, kurulum gerektirmez.
 
@@ -50,6 +56,30 @@ Her hesaba **⚙ Ayarlar → Hesap şifresi** bölümünden şifre konabilir; zo
 > **Şifreyi unutursanız kurtarılamaz.** Giriş ekranındaki **Şifremi unuttum** ile hesap sıfırlanabilir: sohbet geçmişi silinir ve hesabın anahtarı yenilenir (eşleştiğiniz cihazlarla yeniden eşleşmeniz gerekir). Adınız, ayarlarınız ve indirilen dosyalar korunur.
 >
 > Gelen dosyalar indirme klasörüne normal dosya olarak kaydedilir; hesap şifresi onları şifrelemez.
+
+### Arka planda çalışma, Windows ile başlama, bildirimler (Windows)
+
+- Pencerenin **✕** düğmesine basınca LanChat kapanmaz, saatin yanındaki bildirim alanında (sistem tepsisi) çalışmaya devam eder. Mesaj ve dosyalar gelmeye devam eder. Pencereyi geri açmak için simgeye tıklayın ya da masaüstündeki LanChat'e yeniden çift tıklayın. Tamamen kapatmak için simgeye sağ tıklayıp **Çıkış**'ı seçin.
+- Pencere kapalıyken ya da başka bir programdayken mesaj veya dosya gelirse Windows bildirimi çıkar; bildirime tıklayınca o kişinin sohbeti açılır.
+- **⚙ Ayarlar → Masaüstü** bölümünden:
+  - **Windows açılınca bu hesabı arka planda başlat**: Bilgisayar açılınca LanChat pencere göstermeden, simge olarak başlar. Her hesap için ayrı ayarlanır. (Hesaba şifre konduysa açılışta şifre sorulur.)
+  - **Pencere kapatılınca simgede çalışmaya devam et**: Kapatırsanız ✕ programı tamamen kapatır.
+  - **Bildirim göster**.
+
+Bir hesap zaten açıkken (simgede gizli olsa bile) LanChat'e tekrar tıklanırsa ikinci bir kopya açılmaz; açık olan pencere öne gelir.
+
+### Gönderme hızı sınırı
+
+**⚙ Ayarlar → Aktarım hızı** bölümünden bu bilgisayarın gönderme hızı MB/sn olarak sınırlanabilir; **Yalnızca şu saatler arasında** seçilirse sınır sadece o saatlerde uygulanır (ör. 09–18 arası 20 MB/sn, akşam sınırsız). Değişiklik, süren aktarımlara da hemen uygulanır.
+
+### Ağ üzerinden güncelleme
+
+Bir bilgisayardaki LanChat güncellendiğinde, onunla eşleşmiş diğer bilgisayarlarda üstte “LanChat'in yeni sürümü … bilgisayarında var” çubuğu çıkar:
+
+1. **Güncelle**'ye basın: yeni program o bilgisayardan şifreli bağlantıyla indirilir ve SHA-256 özetiyle doğrulanır.
+2. **Şimdi yeniden başlat**'a basın: program kendini yenisiyle değiştirir ve aynı hesapla yeniden açılır. Sohbet geçmişi ve ayarlar korunur.
+
+Güncelleme yalnızca **eşleşmiş** cihazlardan ve aynı işletim sisteminden alınır. Program, bulunduğu klasöre yazabilmelidir (ör. Masaüstü ya da Belgeler; `Program Files` içine konduysa yönetici izni gerektiğinden güncellenemez). Kullandığınız sürüm, sol alttaki yazıda görünür.
 
 ### Windows güvenlik duvarı
 
@@ -131,6 +161,9 @@ Kaynak kod düzeni:
 | `src/root.rs`     | Açılışta hesap seçimi                        |
 | `src/secure.rs`   | Şifreleme (Noise), anahtarlar, eşleştirme kodu |
 | `src/vault.rs`    | Hesap şifresiyle diskte şifreli saklama      |
+| `src/update.rs`   | Ağdan indirilen yeni sürümü kurma            |
+| `src/desktop.rs`  | Sistem tepsisi, Windows ile başlama, bildirimler |
+| `src/shell_icon.rs` | Simge değişince Windows Gezgini'ni yenileme |
 | `build.rs`        | Windows'ta logoyu .exe dosyasına gömer       |
 | `assets/icon/`    | Logo: tüm simge boyutlarında PNG ve `lanchat.ico` |
 | `assets/logo/`    | Logonun kaynak SVG dosyaları                 |

@@ -23,6 +23,32 @@ pub struct Config {
     /// Gönderme hızı sınırı
     #[serde(default)]
     pub speed_limit: crate::net::SpeedLimit,
+    /// Pencere kapatılınca sistem tepsisinde çalışmaya devam et (Windows)
+    #[serde(default = "yes")]
+    pub close_to_tray: bool,
+    /// Yeni mesaj ve dosyalarda Windows bildirimi göster
+    #[serde(default = "yes")]
+    pub notifications: bool,
+    /// "Tepside çalışmaya devam ediyor" bilgisi gösterildi mi?
+    #[serde(default)]
+    pub tray_hint_shown: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+const SHOW_REQUEST: &str = "goster";
+
+/// Hesap başka bir pencerede (belki tepside gizli) açıksa o pencereden öne
+/// gelmesini ister.
+pub fn request_show(profile_dir: &Path) {
+    let _ = fs::write(profile_dir.join(SHOW_REQUEST), b"");
+}
+
+/// Bu hesap için "öne gel" isteği var mı? (varsa siler)
+pub fn take_show_request(profile_dir: &Path) -> bool {
+    fs::remove_file(profile_dir.join(SHOW_REQUEST)).is_ok()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -208,6 +234,9 @@ impl Config {
             manual_ips: Vec::new(),
             trusted: Vec::new(),
             speed_limit: Default::default(),
+            close_to_tray: true,
+            notifications: true,
+            tray_hint_shown: false,
         }
     }
 

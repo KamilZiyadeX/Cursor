@@ -4,6 +4,10 @@
 //!   lanchat --hesap "Kamil – İş"   bu adlı hesabı açar (yoksa oluşturur)
 //!   lanchat --hesap-id <kimlik>    (uygulamanın kendi kullandığı) kimlikle açar
 //!   --guncelleme                   güncelleme sonrası: eski sürümün kapanmasını bekler
+//!   --arka-plan                    pencereyi göstermeden, tepside başlar (Windows açılışı)
+//!
+//! İstenen hesap başka bir pencerede zaten açıksa (tepside gizli olabilir) o
+//! pencere öne getirilir ve bu yeni işlem kapanır.
 
 use crate::app::{self, LanChatApp};
 use crate::storage::{self, LockedProfile, Profile, ProfileError, ProfileInfo, UnlockError};
@@ -55,6 +59,7 @@ type UnlockResult = Result<Profile, (LockedProfile, UnlockError)>;
 /// Şifreli bir hesabın giriş ekranı.
 struct Unlock {
     name: String,
+    dir: PathBuf,
     /// Şifre denenirken arka plan iş parçacığına geçer
     locked: Option<LockedProfile>,
     working: Option<Receiver<UnlockResult>>,
@@ -140,19 +145,8 @@ impl Root {
                 let preferred = last
                     .and_then(|id| profiles.iter().find(|p| p.id == id).cloned())
                     .unwrap_or_else(|| profiles[0].clone());
-                if !preferred.in_use {
-                    self.try_open(ctx, &preferred);
-                } else if profiles.len() > 1 {
-                    self.picker.message = Some(format!(
-                        "“{}” başka bir pencerede açık. Hangi hesapla devam edilsin?",
-                        preferred.name
-                    ));
-                } else {
-                    self.picker.message = Some(format!(
-                        "“{}” başka bir pencerede açık. Bu pencerede kullanmak için yeni bir hesap oluşturun.",
-                        preferred.name
-                    ));
-                }
+                // Son kullanılan hesap zaten açıksa (tepside gizli olabilir) onu öne getirir
+                self.try_open(ctx, &preferred);
             }
         }
     }
@@ -166,6 +160,7 @@ impl Root {
                 )));
                 self.unlock = Some(Unlock {
                     name: locked.cfg.name.clone(),
+                    dir: locked.dir.clone(),
                     locked: Some(locked),
                     working: None,
                     password: String::new(),
@@ -178,19 +173,25 @@ impl Root {
                 Ok(profile) => self.start_chat(ctx, profile),
                 Err((_, e)) => self.picker.message = Some(e.to_string()),
             },
+            Err(ProfileError::InUse) => self.bring_to_front(ctx, p),
             Err(e) => {
-                self.picker.message = Some(match e {
-                    ProfileError::InUse => format!("“{}” başka bir pencerede zaten açık", p.name),
-                    other => other.to_string(),
-                });
+                self.picker.message = Some(e.to_string());
                 self.picker.profiles = storage::list_profiles(&self.root_dir);
             }
         }
     }
 
+    /// Hesap başka bir pencerede açık: o pencereyi öne getir, bu pencereyi kapat.
+    fn bring_to_front(&mut self, ctx: &egui::Context, p: &ProfileInfo) {
+        storage::request_show(&p.dir);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     fn start_chat(&mut self, ctx: &egui::Context, profile: Profile) {
+        // Şifre girilerek açıldıysa kullanıcı zaten pencerenin başında: gizleme
+        let hidden = self.unlock.is_none() && std::env::args().any(|a| a == "--arka-plan");
         self.unlock = None;
-        self.chat = Some(LanChatApp::new(ctx, self.root_dir.clone(), profile));
+        self.chat = Some(LanChatApp::new(ctx, self.root_dir.clone(), profile, hidden));
     }
 
     fn unlock_ui(&mut self, ui: &mut egui::Ui) {
@@ -438,6 +439,15 @@ impl eframe::App for Root {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(chat) = &mut self.chat {
             chat.logic(ctx, frame);
+        } else if let Some(u) = &self.unlock
+            && storage::take_show_request(&u.dir)
+        {
+            // Bu hesap için başka bir LanChat açılmak istendi: şifre ekranını öne getir
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.chat.is_none() {
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 
