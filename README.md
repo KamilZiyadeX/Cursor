@@ -9,18 +9,26 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 - Sunucu, hesap ya da internet bağlantısı gerekmez: her şey yerel ağın içinde kalır.
 - **Uçtan uca şifreli**: Tüm mesajlar ve dosyalar şifrelenir. Yalnızca eşleştirdiğiniz cihazlar size mesaj ve dosya gönderebilir.
 - Aynı ağdaki LanChat'ler birbirini **otomatik bulur**, birkaç saniye içinde kişi listesinde görünür.
-- **Mesajlar**: Enter gönderir, Shift+Enter yeni satır ekler. Mesaja sağ tıklayınca **Yanıtla**, **Kopyala**, **Benden sil** ve **Herkesten sil** çıkar. Karşı taraf yazarken “yazıyor…”, mesajınızı okuduğunda mavi ✔✔ görünür.
+- **Mesajlar**: Enter gönderir, Shift+Enter yeni satır ekler. Mesaja sağ tıklayınca 👍 ❤ 😂 😮 😢 🙏 **tepkileri**, **Düzenle** (kendi mesajınız), **Yanıtla**, **Kopyala**, **Benden sil** ve **Herkesten sil** çıkar. Karşı taraf yazarken “yazıyor…”, mesajınızı okuduğunda mavi ✔✔ görünür.
+- **Karşı taraf kapalıyken de gönderin**: Çevrimdışı kişiye yazdığınız mesaj ve dosyalar “🕓 sırada” bekler, kişi çevrimiçi olunca kendiliğinden gider.
+- **👥 Gruplar**: Eşleştiğiniz kişilerle adlı grup sohbetleri.
+- **📳 Titreşim**: MSN'deki gibi karşı tarafın penceresini öne getirip sallar.
+- **🎤 Sesli mesaj**: Mikrofondan kaydedip gönderin; sohbette ▶ ile dinlenir.
+- **Ekran görüntüsü ve pano**: Ctrl+V ile ekran görüntüsünü yapıştırıp gönderin; Ctrl+Shift+V panodaki dosyaları, resmi ya da metni gönderir.
 - **Arama**: Sohbetin sağ üstündeki 🔍 (ya da Ctrl+F) o sohbetteki mesajlarda ve dosya adlarında arar; Türkçe harflerde büyük/küçük ayrımı yapmaz.
-- **📢 Herkese**: Kişi listesinin en üstündeki bu sohbetten yazılan mesaj ve gönderilen dosyalar, o an çevrimiçi olan tüm eşleşmiş cihazlara gider.
+- **📢 Herkese**: Kişi listesinin en üstündeki bu sohbetten yazılan mesaj ve gönderilen dosyalar tüm eşleşmiş cihazlara gider (çevrimdışı olanlara açılınca).
 - **Resim önizleme**: Gönderilen ve gelen resimler (PNG, JPG, GIF, WebP, BMP) sohbette küçük resim olarak görünür.
-- **Dosya ve klasörler**: 📎 → *Dosya gönder* / *Klasör gönder* ile seçin ya da pencereye sürükleyip bırakın. **Boyut ve dosya sayısı sınırı yoktur** (1 TB'lık bir klasör de gönderilebilir). Klasörler alt klasörleri, boş klasörleri ve dosyaların değiştirilme tarihleriyle birlikte aynen kopyalanır.
+- **Dosya ve klasörler**: 📎 → *Dosya gönder* / *Klasör gönder* ile seçin, pencereye sürükleyip bırakın ya da Dosya Gezgini'nde sağ tık → **Gönder → LanChat** deyin. **Boyut ve dosya sayısı sınırı yoktur** (1 TB'lık bir klasör de gönderilebilir). Klasörler alt klasörleri, boş klasörleri ve dosyaların değiştirilme tarihleriyle birlikte aynen kopyalanır.
 - **Kaldığı yerden devam**: Bağlantı koparsa, bilgisayar kapanırsa ya da **✖ İptal**'e basılırsa yarım kalan kısım silinmez. Gönderen **▶ Kaldığı yerden devam et** dediğinde tamamlanan dosyalar atlanır, yarım kalan dosya kaldığı bayttan sürer.
 - Aktarım sırasında **hız** ve **kalan süre** gösterilir. Alıcıda yeterli boş alan yoksa aktarım başlamadan reddedilir.
-- Gelen dosyalar `İndirilenler/LanChat` klasörüne kaydedilir (Ayarlar'dan değiştirilebilir). Her dosyanın yanında **Aç** ve **Klasörde göster** düğmeleri vardır.
+- Gelen dosyalar `İndirilenler/LanChat` klasörüne kaydedilir (Ayarlar'dan değiştirilebilir). Her dosyanın yanında **Aç** ve **Klasörde göster** düğmeleri vardır; Windows'ta dosyayı sohbetten tutup masaüstüne ya da bir klasöre **sürükleyip bırakabilirsiniz**.
 - **Birden çok hesap**: Aynı Windows oturumunda birden fazla LanChat hesabı (ör. “Kamil – İş” ve “Kamil – Kişisel”) aynı anda ayrı pencerelerde açık olabilir. Her hesabın kendi adı, sohbet geçmişi ve indirme klasörü vardır; aynı bilgisayardaki hesaplar birbirine de mesaj ve dosya gönderebilir.
 - **Bildirimler ve arka planda çalışma** (Windows): Yeni mesaj ve dosyalarda Windows bildirimi çıkar. Pencere kapatılınca LanChat saatin yanındaki simgede çalışmaya devam eder; istenirse Windows açılınca kendiliğinden başlar.
 - **Hız sınırı**: Büyük aktarımlar ağı tıkamasın diye gönderme hızı sınırlanabilir (isterseniz yalnızca mesai saatlerinde).
 - **Ağdan güncelleme**: Eşleştiğiniz bir bilgisayarda daha yeni bir LanChat varsa tek tıkla ondan güncellenir; internetten bir şey indirmeye gerek kalmaz.
+- **⏰ Uzaktan uyandırma**: Kapalı ya da uykudaki bilgisayarı Wake-on-LAN ile açmayı dener.
+- **Görünüm**: Açık/koyu tema ve yazı boyutu (Ctrl + artı/eksi).
+- **Dışa aktarma ve yedek**: Sohbeti web sayfası ya da metin olarak kaydedin; hesabı tek dosyaya yedekleyip başka bilgisayarda geri yükleyin.
 - Okunmamış mesaj sayısı, pencere başlığında ve görev çubuğunda yanıp sönme ile gösterilir.
 - Sohbet geçmişi saklanır; uygulama kapatılıp açılınca kaybolmaz.
 - Windows, macOS ve Linux'ta çalışır. Tek dosyadır, kurulum gerektirmez.
@@ -56,6 +64,55 @@ Her hesaba **⚙ Ayarlar → Hesap şifresi** bölümünden şifre konabilir; zo
 > **Şifreyi unutursanız kurtarılamaz.** Giriş ekranındaki **Şifremi unuttum** ile hesap sıfırlanabilir: sohbet geçmişi silinir ve hesabın anahtarı yenilenir (eşleştiğiniz cihazlarla yeniden eşleşmeniz gerekir). Adınız, ayarlarınız ve indirilen dosyalar korunur.
 >
 > Gelen dosyalar indirme klasörüne normal dosya olarak kaydedilir; hesap şifresi onları şifrelemez.
+
+### Mesajlar: düzenleme, tepki, titreşim
+
+- **Düzenleme**: Kendi metin mesajınıza sağ tık → **✏ Düzenle**. Düzeltilmiş metin karşı tarafta da görünür, yanında “düzenlendi” yazar.
+- **Tepkiler**: Mesaja sağ tıklayınca üstteki 👍 ❤ 😂 😮 😢 🙏 satırından birini seçin; tepkiler balonun altında görünür. Aynı tepkiye tekrar basmak kaldırır.
+- **📳 Titreşim**: Yazma kutusunun yanındaki düğme, karşı tarafın penceresini öne getirir, o sohbeti açar ve pencereyi sallar. Aynı kişiye 10 saniyede bir gönderilebilir.
+
+### Çevrimdışı kişiye gönderme (sıra)
+
+Karşı bilgisayar kapalıyken de yazabilir ve dosya gönderebilirsiniz: mesaj “🕓 sırada” olarak bekler ve kişi çevrimiçi olunca **kendiliğinden** gider. Bağlantı kurulamadığı için gönderilemeyen mesajlar da sıraya döner; LanChat kapatılırken yarım kalan gönderimler bir sonraki açılışta kaldığı yerden sürer. Düzeltme, tepki ve “herkesten sil” de çevrimdışı kişiye sıraya girer.
+
+### Gruplar
+
+1. Kişi listesindeki **➕ Yeni grup**'a basın, gruba ad verin ve üyeleri seçin.
+2. Gruba yazdığınız ilk mesajla birlikte grup, üyelerin bilgisayarında da kendiliğinden belirir.
+
+Grup mesajları her üyeye ayrı ayrı (şifreli) gönderilir. Bu yüzden herkes **yalnızca eşleştiği üyelere** mesaj gönderebilir; eşleşmediğiniz üyeler grup başlığında ⚠ ile gösterilir. Grubun adı ve üyeleri **⚙ Grup**'tan değiştirilebilir, gruptan çıkılabilir.
+
+### Ekran görüntüsü, pano ve sesli mesaj
+
+- **Ctrl+V**: Panoda bir resim varsa (ör. Win+Shift+S ile alınan ekran görüntüsü) önizleme açılır; Enter ile gönderilir. Resim, indirme klasöründeki *Gönderilen ekran görüntüleri* klasörüne kaydedilir.
+- **Ctrl+Shift+V** ya da **📎 → Panodakini gönder**: Dosya Gezgini'nde kopyaladığınız dosyalar, resim ya da kopyaladığınız metin gönderilir.
+- **🎤 Sesli mesaj**: Düğmeye basınca kayıt başlar; **Gönder** ile gönderilir (en fazla 5 dakika). Sesli mesajlar ve diğer `.wav` dosyaları sohbette ▶ ile dinlenebilir. Windows'ta *Ayarlar → Gizlilik → Mikrofon* bölümünde masaüstü uygulamalarının mikrofona erişimine izin verilmiş olmalıdır.
+
+### Dosya Gezgini'nden gönderme
+
+LanChat ilk açılışta Windows'un **Gönder** menüsüne kendini ekler: dosya ya da klasörlere sağ tıklayıp **Gönder → LanChat** deyin (Windows 11'de *Diğer seçenekleri göster* altında). LanChat açıksa seçilenler o pencereye gelir, kapalıysa açılır; ardından **Kime gönderilsin?** diye sorulur.
+
+Gelen bir dosyayı sohbetteki satırından tutup **masaüstüne ya da bir klasöre sürükleyip bırakarak** kopyalayabilirsiniz (Windows).
+
+### Uzaktan uyandırma (Wake-on-LAN)
+
+Eşleştiğiniz bir bilgisayar çevrimdışıyken sohbet başlığında **⏰ Uyandır** düğmesi çıkar. Düğme, o bilgisayarın ağ kartına “uyan” sinyali gönderir. Çalışması için:
+
+- Bilgisayarın BIOS/UEFI ayarlarında *Wake on LAN* açık olmalı,
+- Windows'ta ağ kartının özelliklerinde *Magic Packet ile uyandır* açık olmalı (Aygıt Yöneticisi → Ağ bağdaştırıcıları),
+- tamamen kapalı bilgisayarlar için Windows'un *Hızlı başlangıç* özelliği kapalı olmalı.
+
+Genellikle **kablolu** bağlantıda çalışır. LanChat ağ kartının adresini, o bilgisayar LanChat'in bu sürümüyle bir kez çevrimiçi olduğunda öğrenir.
+
+### Görünüm
+
+**⚙ Ayarlar → Görünüm** bölümünden tema (*Windows'a uy* / *Açık* / *Koyu*) ve yazı boyutu seçilebilir. **Ctrl + artı / eksi** ile de büyütüp küçültebilirsiniz (Ctrl+0: normal); ayar hesap için hatırlanır.
+
+### Sohbeti dışa aktarma ve hesap yedekleme
+
+- **Sohbeti dışa aktar**: Sohbet başlığındaki **⋯ → Sohbeti dışa aktar**. Sohbet, tarayıcıda açılan biçimli bir sayfa (`.html`) ya da düz metin (`.txt`) olarak kaydedilir.
+- **Hesabı yedekle**: **👤 Hesaplar → Bu hesabı yedekle**. Hesabın ayarları, şifreleme anahtarı ve sohbet geçmişi tek bir `.lanchat-yedek` dosyasına kaydedilir. Hesaba şifre konduysa yedekte de şifreli kalır; şifresizse yedeği güvenli bir yerde saklayın. Gelen dosyalar yedeğe girmez.
+- **Geri yükle**: **👤 Hesaplar → Yedekten hesap geri yükle** ya da hesap seçme ekranındaki düğme. Hesap bu bilgisayarda zaten varsa geri yüklenmez. Aynı yedeği iki bilgisayarda aynı anda kullanmayın: iki cihaz aynı kimlikle görünür.
 
 ### Arka planda çalışma, Windows ile başlama, bildirimler (Windows)
 
@@ -130,7 +187,7 @@ Windows SmartScreen “tanınmayan uygulama” uyarısı verirse **Ek bilgi → 
 
 ## Kaynak koddan derleme
 
-[Rust](https://rustup.rs) kurulu olmalı.
+[Rust](https://rustup.rs) kurulu olmalı. Linux'ta ses için ALSA geliştirme paketi de gerekir (`sudo apt install libasound2-dev`).
 
 ```bash
 cargo run --release
@@ -165,6 +222,9 @@ Kaynak kod düzeni:
 | `src/update.rs`   | Ağdan indirilen yeni sürümü kurma            |
 | `src/desktop.rs`  | Sistem tepsisi, Windows ile başlama, bildirimler |
 | `src/sound.rs`    | Bildirim sesi (sentezlenen “dıdıt dıt”)       |
+| `src/voice.rs`    | Sesli mesaj: kayıt ve oynatma                |
+| `src/clip.rs`     | Panodan gönderme, ekran görüntüsü            |
+| `src/backup.rs`   | Hesap yedekleme, sohbeti dışa aktarma        |
 | `src/shell_icon.rs` | Simge değişince Windows Gezgini'ni yenileme |
 | `build.rs`        | Windows'ta logoyu .exe dosyasına gömer       |
 | `assets/icon/`    | Logo: tüm simge boyutlarında PNG ve `lanchat.ico` |

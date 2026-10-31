@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "lanchat"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "argon2",
