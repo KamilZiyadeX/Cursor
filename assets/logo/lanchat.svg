@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Zemin: ortası parlak, kenarlara doğru koyulaşan kırmızı -->
+    <radialGradient id="tile" cx="50%" cy="28%" r="82%">
+      <stop offset="0" stop-color="#FF2418"/>
+      <stop offset="0.55" stop-color="#F20006"/>
+      <stop offset="1" stop-color="#C80004"/>
+    </radialGradient>
+    <!-- Zeminin kabarık kenarı: üstte ışık, altta gölge -->
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="0.22" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.78" stop-color="#5A0000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#5A0000" stop-opacity="0.45"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.7" stop-color="#F9F8FA"/>
+      <stop offset="1" stop-color="#EAE8EE"/>
+    </linearGradient>
+    <linearGradient id="sheet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F4F3F6"/>
+      <stop offset="1" stop-color="#D9D6DE"/>
+    </linearGradient>
+    <linearGradient id="tab" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FF3D2E"/>
+      <stop offset="0.55" stop-color="#E80006"/>
+      <stop offset="1" stop-color="#C20004"/>
+    </linearGradient>
+    <radialGradient id="node" cx="38%" cy="30%" r="78%">
+      <stop offset="0" stop-color="#FF5A47"/>
+      <stop offset="0.45" stop-color="#EE0608"/>
+      <stop offset="1" stop-color="#B00003"/>
+    </radialGradient>
+    <linearGradient id="specular" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5.5" flood-color="#6E0000" flood-opacity="0.5"/>
+    </filter>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="2.5" stdDeviation="2" flood-color="#5A0000" flood-opacity="0.4"/>
+    </filter>
+    <!-- Balon şekli (kavisli kuyruk) -->
+    <path id="b" d="M60 22H200C214 22 226 34 226 48V164C226 178 214 190 200 190H112C101 204 86 216 62 225C71 211 74 200 73 190H60C46 190 34 178 34 164V48C34 34 46 22 60 22Z"/>
+  </defs>
+
+  <!-- Zemin -->
+  <rect width="256" height="256" rx="56" fill="url(#tile)"/>
+  <rect x="2" y="2" width="252" height="252" rx="54" fill="none" stroke="url(#rim)" stroke-width="4"/>
+  <rect x="0.5" y="0.5" width="255" height="255" rx="55.5" fill="none" stroke="#9C0003" stroke-opacity="0.6"/>
+
+  <!-- Arkadaki iki sayfa (Kapo PDF'teki gibi) -->
+  <use href="#b" transform="translate(-19 13)" fill="url(#sheet)" stroke="#BDB8C4" stroke-width="1" filter="url(#shadow)"/>
+  <use href="#b" transform="translate(-10 7)" fill="url(#sheet)" stroke="#C6C2CC" stroke-width="1"/>
+
+  <!-- Öndeki balon: altta kâğıt kalınlığı, üstte yüzey -->
+  <use href="#b" transform="translate(0 3.5)" fill="#C2BDC9"/>
+  <use href="#b" fill="url(#bubble)" stroke="#D3CFD8" stroke-width="1" filter="url(#shadow)"/>
+
+  <!-- LAN etiketi -->
+  <rect x="50" y="38" width="100" height="42" rx="10" fill="url(#tab)" stroke="#9A0002" stroke-width="1.5"/>
+  <rect x="52.5" y="40" width="95" height="17" rx="8" fill="#FFFFFF" fill-opacity="0.13"/>
+  <g font-family="Archivo Black" font-size="31" text-anchor="middle" letter-spacing="1">
+    <text x="100" y="72.5" fill="#7A0002" fill-opacity="0.55">LAN</text>
+    <text x="100" y="70.5" fill="#FFFFFF">LAN</text>
+  </g>
+
+  <!-- K-A-P-O bağlantıları (boru gibi) -->
+  <path d="M70 158L110 114L150 158L190 114" fill="none" stroke="#860002" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M70 158L110 114L150 158L190 114" fill="none" stroke="#E80608" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M70 158L110 114L150 158L190 114" transform="translate(-1.5 -3)" fill="none" stroke="#FF8C7A" stroke-opacity="0.55" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Düğümler: cam küre -->
+  <g filter="url(#soft)">
+    <circle cx="70" cy="158" r="24" fill="url(#node)" stroke="#950002" stroke-width="1.5"/>
+    <circle cx="110" cy="114" r="24" fill="url(#node)" stroke="#950002" stroke-width="1.5"/>
+    <circle cx="150" cy="158" r="24" fill="url(#node)" stroke="#950002" stroke-width="1.5"/>
+    <circle cx="190" cy="114" r="24" fill="url(#node)" stroke="#950002" stroke-width="1.5"/>
+  </g>
+  <g fill="url(#specular)">
+    <ellipse cx="63" cy="145" rx="12" ry="6.5" transform="rotate(-25 63 145)"/>
+    <ellipse cx="103" cy="101" rx="12" ry="6.5" transform="rotate(-25 103 101)"/>
+    <ellipse cx="143" cy="145" rx="12" ry="6.5" transform="rotate(-25 143 145)"/>
+    <ellipse cx="183" cy="101" rx="12" ry="6.5" transform="rotate(-25 183 101)"/>
+  </g>
+  <g font-family="Archivo Black" font-size="27" text-anchor="middle">
+    <g fill="#6E0002" fill-opacity="0.55">
+      <text x="70" y="169.5">K</text>
+      <text x="110" y="125.5">A</text>
+      <text x="150" y="169.5">P</text>
+      <text x="190" y="125.5">O</text>
+    </g>
+    <g fill="#FFFFFF">
+      <text x="70" y="167.5">K</text>
+      <text x="110" y="123.5">A</text>
+      <text x="150" y="167.5">P</text>
+      <text x="190" y="123.5">O</text>
+    </g>
+  </g>
+</svg>

@@ -1,4 +1,8 @@
+<p align="center"><img src="assets/icon/lanchat-128.png" width="128" height="128" alt="LanChat logosu"></p>
+
 # LanChat
+
+*Bir Kapo uygulaması.*
 
 Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında **mesaj ve dosya gönderme** masaüstü uygulaması. Rust ile yazıldı.
 
@@ -113,6 +117,9 @@ Kaynak kod düzeni:
 | `src/storage.rs`  | Hesaplar, ayarlar ve sohbet geçmişinin kaydı |
 | `src/root.rs`     | Açılışta hesap seçimi                        |
 | `src/secure.rs`   | Şifreleme (Noise), anahtarlar, eşleştirme kodu |
+| `build.rs`        | Windows'ta logoyu .exe dosyasına gömer       |
+| `assets/icon/`    | Logo: tüm simge boyutlarında PNG ve `lanchat.ico` |
+| `assets/logo/`    | Logonun kaynak SVG dosyaları                 |
 
 ### Veri klasörü
 
@@ -135,3 +142,11 @@ Her hesabın ayarları (`config.json`) ve sohbet geçmişi (`history.json`) bu k
 - Bu sürüm eski (şifresiz) sürümlerle konuşamaz; iki bilgisayarda da yeni sürümü kullanın.
 
 Gelen dosyalar otomatik kaydedilir ama otomatik açılmaz. Eşleştirdiğiniz kişiden bile beklemediğiniz bir dosya gelirse açmadan önce dikkatli olun.
+
+## Logo
+
+Kapo PDF ile aynı aileden: parlak kırmızı zemin, üst üste duran beyaz konuşma balonları, sol üstte kırmızı **LAN** etiketi ve ortada **K-A-P-O** ağı.
+
+- `assets/logo/lanchat.svg`: 64 px ve üstü için ayrıntılı çizim (harfler *Archivo Black* yazı tipiyle).
+- `assets/logo/lanchat-16.svg`, `-24`, `-32`, `-48`: küçük boyutlar için piksel ızgarasına göre ayrı ayrı çizilmiş sade sürümler.
+- `assets/icon/`: bu çizimlerden üretilmiş PNG'ler ve hepsini içeren `lanchat.ico`. Pencere simgesi, uygulama içi logo ve Windows'ta `.exe` simgesi buradan alınır.

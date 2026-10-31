@@ -81,6 +81,7 @@ pub struct LanChatApp {
     cfg: Config,
     /// Açık hesap; kilidi pencere kapanana kadar tutar
     _profile: Profile,
+    logo: egui::TextureHandle,
     new_account: Option<NewAccount>,
     out_pair: Option<OutPair>,
     in_pair: Option<InPair>,
@@ -110,6 +111,7 @@ impl LanChatApp {
         let _ = storage::set_last_profile(&root_dir, &cfg.id);
 
         let local_registry = Some(storage::online_dir(&root_dir));
+        let logo = small_logo_texture(ctx);
         let ctx = ctx.clone();
         let tcp_port = std::env::var("LANCHAT_PORT")
             .ok()
@@ -152,6 +154,7 @@ impl LanChatApp {
             data_dir,
             cfg,
             _profile: profile,
+            logo,
             new_account: None,
             out_pair: None,
             in_pair: None,
@@ -579,7 +582,8 @@ impl LanChatApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("💬 LanChat").strong().size(18.0));
+            ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(26.0, 26.0)));
+            ui.label(RichText::new("LanChat").strong().size(18.0));
             ui.separator();
             ui.label(RichText::new(format!("Adın: {}", self.cfg.name)).weak());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1585,6 +1589,33 @@ impl eframe::App for LanChatApp {
 }
 
 /* ------------------------------ Yardımcılar ------------------------------ */
+
+/// Üst çubuktaki küçük logo: küçük boyutlar için çizilmiş sade sürüm.
+pub fn small_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    load_png_texture(
+        ctx,
+        "lanchat-logo-small",
+        include_bytes!("../assets/icon/lanchat-48.png"),
+    )
+}
+
+/// Büyük gösterimler için harfli tam sürüm.
+pub fn large_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    load_png_texture(
+        ctx,
+        "lanchat-logo-large",
+        include_bytes!("../assets/icon/lanchat-128.png"),
+    )
+}
+
+fn load_png_texture(ctx: &egui::Context, name: &str, png: &[u8]) -> egui::TextureHandle {
+    let icon = eframe::icon_data::from_png_bytes(png).expect("gömülü logo geçerli bir PNG");
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+}
 
 /// Verilen hesabı yeni bir LanChat penceresinde (ayrı işlem olarak) açar.
 pub fn open_account_window(profile_id: &str) -> std::io::Result<()> {

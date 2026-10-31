@@ -53,6 +53,7 @@ pub struct Root {
     chat: Option<LanChatApp>,
     picker: Picker,
     title_set: bool,
+    logo: egui::TextureHandle,
 }
 
 impl Root {
@@ -69,6 +70,7 @@ impl Root {
             root_dir,
             chat: None,
             title_set: false,
+            logo: app::large_logo_texture(&cc.egui_ctx),
         };
         root.startup(&cc.egui_ctx);
         root
@@ -161,7 +163,9 @@ impl Root {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(RichText::new("💬 LanChat").size(26.0).strong());
+                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                ui.add_space(6.0);
+                ui.label(RichText::new("LanChat").size(26.0).strong());
                 ui.add_space(4.0);
                 ui.label(RichText::new("Hangi hesapla açılsın?").size(16.0));
                 ui.add_space(12.0);
