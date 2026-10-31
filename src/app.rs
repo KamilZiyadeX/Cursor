@@ -108,6 +108,7 @@ struct Settings {
     speed: net::SpeedLimit,
     close_to_tray: bool,
     notifications: bool,
+    notification_sound: bool,
     autostart: bool,
     has_password: bool,
     pw_current: String,
@@ -207,6 +208,11 @@ impl LanChatApp {
             )
         };
         desktop::refresh_autostart(&cfg.id);
+        {
+            // Bildirimler için Başlat menüsü kısayolu ve uygulama kimliği
+            let dir = root_dir.clone();
+            std::thread::spawn(move || desktop::init_notifications(&dir));
+        }
         // Tepsi yoksa (ör. oluşturulamadıysa) pencereyi gizlemek onu kaybettirir
         let start_hidden = start_hidden && tray.is_some();
         let ctx = ctx.clone();
@@ -372,6 +378,7 @@ impl LanChatApp {
             &self.root_dir,
             title,
             &desktop::preview(body),
+            self.cfg.notification_sound && peer_id.is_some(),
             peer_id,
             self.desk_tx.clone(),
             move || ctx.request_repaint(),
@@ -1104,6 +1111,7 @@ impl LanChatApp {
                         speed: self.cfg.speed_limit,
                         close_to_tray: self.cfg.close_to_tray,
                         notifications: self.cfg.notifications,
+                        notification_sound: self.cfg.notification_sound,
                         autostart: desktop::autostart_enabled(&self.cfg.id),
                         has_password: self.profile.has_password(),
                         pw_current: String::new(),
@@ -2052,6 +2060,9 @@ impl LanChatApp {
                         "Pencere kapatılınca saatin yanındaki simgede çalışmaya devam et",
                     );
                     ui.checkbox(&mut s.notifications, "Yeni mesaj ve dosyalarda bildirim göster");
+                    ui.add_enabled_ui(s.notifications, |ui| {
+                        ui.checkbox(&mut s.notification_sound, "Bildirim sesi çal");
+                    });
                     ui.add_space(10.0);
                 }
 
@@ -2204,9 +2215,7 @@ impl LanChatApp {
             self.cfg.speed_limit = s.speed;
             self.cfg.close_to_tray = s.close_to_tray;
             self.cfg.notifications = s.notifications;
-            if let Some(tray) = &self.tray {
-                tray.set_tooltip(&format!("LanChat — {}", self.cfg.name));
-            }
+            self.cfg.notification_sound = s.notification_sound;
             if desktop::HAS_TRAY
                 && s.autostart != desktop::autostart_enabled(&self.cfg.id)
                 && let Err(e) = desktop::set_autostart(&self.cfg.id, s.autostart)
@@ -2654,6 +2663,19 @@ impl eframe::App for LanChatApp {
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
+        }
+
+        if let Some(tray) = &mut self.tray {
+            let blinking = total > 0 && !self.focused;
+            tray.set_blinking(blinking);
+            tray.set_tooltip(&if total > 0 {
+                format!("LanChat — {}\n{total} okunmamış mesaj", self.cfg.name)
+            } else {
+                format!("LanChat — {}", self.cfg.name)
+            });
+            if blinking {
+                ctx.request_repaint_after(desktop::BLINK_INTERVAL / 2);
+            }
         }
 
         self.send_read_receipts();

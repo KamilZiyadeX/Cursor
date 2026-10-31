@@ -29,6 +29,9 @@ pub struct Config {
     /// Yeni mesaj ve dosyalarda Windows bildirimi göster
     #[serde(default = "yes")]
     pub notifications: bool,
+    /// Bildirimle birlikte ses çal
+    #[serde(default = "yes")]
+    pub notification_sound: bool,
     /// "Tepside çalışmaya devam ediyor" bilgisi gösterildi mi?
     #[serde(default)]
     pub tray_hint_shown: bool,
@@ -236,6 +239,7 @@ impl Config {
             speed_limit: Default::default(),
             close_to_tray: true,
             notifications: true,
+            notification_sound: true,
             tray_hint_shown: false,
         }
     }

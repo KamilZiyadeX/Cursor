@@ -60,11 +60,12 @@ Her hesaba **⚙ Ayarlar → Hesap şifresi** bölümünden şifre konabilir; zo
 ### Arka planda çalışma, Windows ile başlama, bildirimler (Windows)
 
 - Pencerenin **✕** düğmesine basınca LanChat kapanmaz, saatin yanındaki bildirim alanında (sistem tepsisi) çalışmaya devam eder. Mesaj ve dosyalar gelmeye devam eder. Pencereyi geri açmak için simgeye tıklayın ya da masaüstündeki LanChat'e yeniden çift tıklayın. Tamamen kapatmak için simgeye sağ tıklayıp **Çıkış**'ı seçin.
-- Pencere kapalıyken ya da başka bir programdayken mesaj veya dosya gelirse Windows bildirimi çıkar; bildirime tıklayınca o kişinin sohbeti açılır.
+- Pencere kapalıyken ya da başka bir programdayken mesaj veya dosya gelirse Windows bildirimi ve bildirim sesi çıkar; bildirime tıklayınca o kişinin sohbeti açılır. Okunmamış mesaj varken saatin yanındaki LanChat simgesi yanıp söner (pencere açılınca durur).
+- Windows, kurulum yapılmadan çalışan programların bildirimlerini ancak Başlat menüsünde kısayolları varsa gösterdiği için LanChat ilk açılışta Başlat menüsüne bir **LanChat** kısayolu ekler (böylece Başlat'ta aranarak da açılabilir).
 - **⚙ Ayarlar → Masaüstü** bölümünden:
   - **Windows açılınca bu hesabı arka planda başlat**: Bilgisayar açılınca LanChat pencere göstermeden, simge olarak başlar. Her hesap için ayrı ayarlanır. (Hesaba şifre konduysa açılışta şifre sorulur.)
   - **Pencere kapatılınca simgede çalışmaya devam et**: Kapatırsanız ✕ programı tamamen kapatır.
-  - **Bildirim göster**.
+  - **Bildirim göster** ve **Bildirim sesi çal**.
 
 Bir hesap zaten açıkken (simgede gizli olsa bile) LanChat'e tekrar tıklanırsa ikinci bir kopya açılmaz; açık olan pencere öne gelir.
 

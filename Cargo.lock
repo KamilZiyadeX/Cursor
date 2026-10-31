@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "lanchat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "chacha20poly1305 0.11.0",
@@ -2504,6 +2504,7 @@ dependencies = [
  "tauri-winrt-notification",
  "tray-icon",
  "uuid",
+ "windows",
  "windows-sys 0.61.2",
  "winresource",
 ]
