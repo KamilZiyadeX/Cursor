@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HISTORY: usize = 5000;
 const INPUT_ID: &str = "composer-input";
+const SEARCH_ID: &str = "chat-search";
 /// "Herkese" sohbetinin kimliği (gerçek bir kişi değil)
 const BROADCAST: &str = "__herkese__";
 
@@ -123,6 +124,10 @@ pub struct LanChatApp {
     last_typing_sent: Option<Instant>,
     /// Yanıtlanan mesaj (hangi sohbette, alıntı)
     replying: Option<(String, ReplyRef)>,
+    /// Açık arama: (hangi sohbette, aranan metin)
+    search: Option<(String, String)>,
+    /// Arama kutusuna odaklanılsın mı (bir kerelik)
+    search_focus: bool,
     /// Resim önizlemeleri (mesaj kimliğine göre)
     thumbs: HashMap<String, Thumb>,
     thumb_tx: Sender<(String, Option<egui::ColorImage>)>,
@@ -204,6 +209,8 @@ impl LanChatApp {
             typing: HashMap::new(),
             last_typing_sent: None,
             replying: None,
+            search: None,
+            search_focus: false,
             thumbs: HashMap::new(),
             thumb_tx,
             thumb_rx,
@@ -1398,11 +1405,37 @@ impl LanChatApp {
         let paired = is_broadcast || self.is_paired(&peer_id);
         let local = self.peer(&peer_id).is_some_and(|p| p.local);
 
+        // Arama (Ctrl+F ile de açılır)
+        if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+            self.search = Some((peer_id.clone(), String::new()));
+            self.search_focus = true;
+        }
+        let query: Option<String> = match &self.search {
+            Some((p, q)) if *p == peer_id && !q.trim().is_empty() => Some(fold_tr(q.trim())),
+            _ => None,
+        };
+        let match_count = query.as_ref().map(|q| {
+            self.messages
+                .iter()
+                .filter(|m| m.peer_id == peer_id && message_matches(m, q))
+                .count()
+        });
+
         let mut pair_clicked = false;
+        let mut toggle_search = false;
         egui::Panel::top("chat-header").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&name).strong().size(16.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("🔍")
+                        .on_hover_text("Bu sohbette ara (Ctrl+F)")
+                        .clicked()
+                    {
+                        toggle_search = true;
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 if is_broadcast {
                     let names: Vec<&str> = targets.iter().map(|(_, n, _)| n.as_str()).collect();
                     let text = if names.is_empty() {
@@ -1440,9 +1473,58 @@ impl LanChatApp {
                     )
                     .on_hover_text(hover);
                 }
+                    });
+                });
             });
+            // Arama satırı
+            let mut close_search = false;
+            if let Some((p, q)) = &mut self.search
+                && *p == peer_id
+            {
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        TextEdit::singleline(q)
+                            .id(Id::unique(SEARCH_ID))
+                            .hint_text("Bu sohbette ara…")
+                            .desired_width(260.0),
+                    );
+                    if self.search_focus {
+                        r.request_focus();
+                        self.search_focus = false;
+                    }
+                    if r.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                        close_search = true;
+                    }
+                    if let Some(n) = match_count {
+                        let text = if n == 0 {
+                            "sonuç yok".to_string()
+                        } else {
+                            format!("{n} sonuç")
+                        };
+                        ui.label(RichText::new(text).small().weak());
+                    }
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Aramayı kapat (Esc)")
+                        .clicked()
+                    {
+                        close_search = true;
+                    }
+                });
+            }
+            if close_search {
+                self.search = None;
+            }
             ui.add_space(4.0);
         });
+        if toggle_search {
+            if self.search.as_ref().is_some_and(|(p, _)| *p == peer_id) {
+                self.search = None;
+            } else {
+                self.search = Some((peer_id.clone(), String::new()));
+                self.search_focus = true;
+            }
+        }
 
         if paired {
             egui::Panel::bottom("composer").show(ui, |ui| self.composer(ui));
@@ -1499,8 +1581,18 @@ impl LanChatApp {
                 .show(ui, |ui| {
                     ui.add_space(8.0);
                     let mut last_day = String::new();
-                    let msgs: Vec<&ChatMessage> = self.messages.iter().filter(|m| m.peer_id == peer_id).collect();
-                    if msgs.is_empty() {
+                    let msgs: Vec<&ChatMessage> = self
+                        .messages
+                        .iter()
+                        .filter(|m| m.peer_id == peer_id)
+                        .filter(|m| query.as_ref().is_none_or(|q| message_matches(m, q)))
+                        .collect();
+                    if msgs.is_empty() && query.is_some() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(RichText::new("Aramayla eşleşen mesaj yok.").weak());
+                        });
+                    } else if msgs.is_empty() {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.label(RichText::new("Henüz mesaj yok. Bir mesaj yazın ya da dosyaları pencereye sürükleyip bırakın.").weak());
@@ -2297,6 +2389,38 @@ pub fn setup_style(ctx: &egui::Context) {
     });
 }
 
+/// Türkçe karakterlere ve büyük/küçük harfe duyarsız karşılaştırma için sadeleştirir
+/// ("Şifre" → "sifre", "İSTANBUL" → "istanbul").
+fn fold_tr(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'İ' | 'I' | 'ı' => 'i',
+            'Ş' | 'ş' => 's',
+            'Ğ' | 'ğ' => 'g',
+            'Ü' | 'ü' => 'u',
+            'Ö' | 'ö' => 'o',
+            'Ç' | 'ç' => 'c',
+            c => c,
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Mesaj, sadeleştirilmiş aramayla eşleşiyor mu? (metin, dosya adı, alıntı)
+fn message_matches(m: &ChatMessage, folded_query: &str) -> bool {
+    if m.deleted {
+        return false;
+    }
+    let body = match &m.body {
+        Body::Text(t) => t.as_str(),
+        Body::File { name, .. } => name.as_str(),
+    };
+    fold_tr(body).contains(folded_query)
+        || m.reply_to
+            .as_ref()
+            .is_some_and(|r| fold_tr(&r.preview).contains(folded_query))
+}
+
 fn validate_new_password(new: &str, repeat: &str) -> Result<(), String> {
     if new.chars().count() < 4 {
         Err("Şifre en az 4 karakter olmalı".into())
@@ -2439,6 +2563,40 @@ mod tests {
         let t = image::open(&path).unwrap().thumbnail(560, 440);
         assert_eq!((t.width(), t.height()), (560, 280));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_is_turkish_and_case_insensitive() {
+        assert_eq!(fold_tr("İSTANBUL Şişli ığdır"), "istanbul sisli igdir");
+        let msg = |t: &str| {
+            ChatMessage::new(
+                "1".into(),
+                "p".into(),
+                true,
+                Body::Text(t.into()),
+                MsgState::Done,
+            )
+        };
+        assert!(message_matches(&msg("Yeni Şifre geldi"), &fold_tr("sifre")));
+        assert!(message_matches(&msg("aksam toplantisi"), &fold_tr("Akşam")));
+        assert!(!message_matches(&msg("merhaba"), &fold_tr("dosya")));
+        let file = ChatMessage::new(
+            "2".into(),
+            "p".into(),
+            false,
+            Body::File {
+                name: "Teklif Şubat.pdf".into(),
+                size: 1,
+                path: None,
+                is_dir: false,
+                file_count: 1,
+            },
+            MsgState::Done,
+        );
+        assert!(message_matches(&file, &fold_tr("şubat")));
+        let mut deleted = msg("gizli");
+        deleted.deleted = true;
+        assert!(!message_matches(&deleted, "gizli"));
     }
 
     #[test]
