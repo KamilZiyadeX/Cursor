@@ -9,6 +9,7 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 - **Kaldığı yerden devam**: Bağlantı koparsa, bilgisayar kapanırsa ya da **✖ İptal**'e basılırsa yarım kalan kısım silinmez. Gönderen **▶ Kaldığı yerden devam et** dediğinde tamamlanan dosyalar atlanır, yarım kalan dosya kaldığı bayttan sürer.
 - Aktarım sırasında **hız** ve **kalan süre** gösterilir. Alıcıda yeterli boş alan yoksa aktarım başlamadan reddedilir.
 - Gelen dosyalar `İndirilenler/LanChat` klasörüne kaydedilir (Ayarlar'dan değiştirilebilir). Her dosyanın yanında **Aç** ve **Klasörde göster** düğmeleri vardır.
+- **Birden çok hesap**: Aynı Windows oturumunda birden fazla LanChat hesabı (ör. “Kamil – İş” ve “Kamil – Kişisel”) aynı anda ayrı pencerelerde açık olabilir. Her hesabın kendi adı, sohbet geçmişi ve indirme klasörü vardır; aynı bilgisayardaki hesaplar birbirine de mesaj ve dosya gönderebilir.
 - Okunmamış mesaj sayısı ve görev çubuğunda yanıp sönme ile bildirim.
 - Sohbet geçmişi saklanır; uygulama kapatılıp açılınca kaybolmaz.
 - Windows, macOS ve Linux'ta çalışır. Tek dosyadır, kurulum gerektirmez.
@@ -18,6 +19,16 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 1. Programı **her iki bilgisayarda da** açın (ör. evdeki ve işyerindeki).
 2. İlk açılışta bilgisayarın adı kullanılır. Sağ üstteki **⚙ Ayarlar**'dan anlaşılır bir ad verin (ör. “Kamil – Ofis”).
 3. Birkaç saniye içinde diğer bilgisayar soldaki **Kişiler** listesinde yeşil noktayla görünür. Ona tıklayın ve yazmaya başlayın.
+
+### Birden çok hesap
+
+- Sağ üstteki **👤 Hesaplar → ➕ Yeni hesap…** ile yeni bir hesap oluşturun; yeni hesap ayrı bir pencerede açılır.
+- Var olan bir hesabı açmak için yine **👤 Hesaplar** menüsünden adına tıklayın.
+- LanChat simgesine tıklandığında en son kullanılan hesap açılır; o hesap zaten açıksa hangi hesapla devam edileceği sorulur.
+- Bir hesap aynı anda yalnızca bir pencerede açık olabilir.
+- Belirli bir hesapla açılan bir masaüstü kısayolu için kısayolun **Hedef** alanının sonuna `--hesap "Kamil – İş"` ekleyin (bu adla hesap yoksa oluşturulur).
+
+İlk hesap gelen dosyaları `İndirilenler\LanChat`, sonraki hesaplar `İndirilenler\LanChat (hesap adı)` klasörüne kaydeder; **⚙ Ayarlar**'dan değiştirilebilir. Aynı bilgisayarda birden çok hesap açıkken her biri mesaj için sıradaki portu kullanır (47821, 47822, …).
 
 ### Windows güvenlik duvarı
 
@@ -52,7 +63,7 @@ Bunlara rağmen bağlanılamıyorsa güvenlik duvarında aşağıdaki portlara i
 | Port  | Protokol | Ne için                     |
 |-------|----------|-----------------------------|
 | 47820 | UDP      | Otomatik keşif              |
-| 47821 | TCP      | Mesaj ve dosya aktarımı     |
+| 47821–47830 | TCP | Mesaj ve dosya aktarımı (aynı bilgisayarda birden çok hesap açıksa sıradaki port) |
 
 > Not: Misafir Wi‑Fi'ları ve bazı modemlerdeki “AP izolasyonu” ayarı, aynı ağdaki cihazların birbirine bağlanmasını tamamen engeller. Bu durumda iki bilgisayarın aynı (misafir olmayan) ağa bağlı olduğundan emin olun.
 
@@ -95,11 +106,12 @@ Kaynak kod düzeni:
 | `src/app.rs`      | Arayüz (egui)                               |
 | `src/net.rs`      | UDP keşif, TCP gönderme/alma                |
 | `src/protocol.rs` | Paket biçimi, dosya adı temizleme           |
-| `src/storage.rs`  | Ayarlar ve sohbet geçmişinin kaydı          |
+| `src/storage.rs`  | Hesaplar, ayarlar ve sohbet geçmişinin kaydı |
+| `src/root.rs`     | Açılışta hesap seçimi                        |
 
 ### Veri klasörü
 
-Ayarlar (`config.json`) ve sohbet geçmişi (`history.json`) şurada tutulur:
+Her hesabın ayarları (`config.json`) ve sohbet geçmişi (`history.json`) bu klasörün altında `profiles\<hesap kimliği>\` içinde tutulur. Eski sürümden kalan ayarlar ilk açılışta otomatik olarak ilk hesaba taşınır. Veri klasörü:
 
 - Windows: `%APPDATA%\LanChat\LanChat\data`
 - macOS: `~/Library/Application Support/com.LanChat.LanChat`

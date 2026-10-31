@@ -4,6 +4,7 @@
 mod app;
 mod net;
 mod protocol;
+mod root;
 mod storage;
 
 use eframe::egui;
@@ -22,7 +23,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "LanChat",
         options,
-        Box::new(|cc| Ok(Box::new(app::LanChatApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(root::Root::new(cc)))),
     )
 }
 

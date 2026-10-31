@@ -1,0 +1,249 @@
+//! Açılış: hangi hesabın açılacağına karar verir, gerekirse hesap seçme ekranını gösterir.
+//!
+//! Komut satırı:
+//!   lanchat --hesap "Kamil – İş"   bu adlı hesabı açar (yoksa oluşturur)
+//!   lanchat --hesap-id <kimlik>    (uygulamanın kendi kullandığı) kimlikle açar
+
+use crate::app::{self, LanChatApp};
+use crate::storage::{self, ProfileError, ProfileInfo};
+use eframe::egui::{self, Align, Color32, Key, Layout, RichText, TextEdit};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+enum Cli {
+    None,
+    Name(String),
+    Id(String),
+}
+
+fn parse_cli() -> Cli {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--hesap-id" | "--profile-id" => {
+                if let Some(v) = it.next() {
+                    return Cli::Id(v.clone());
+                }
+            }
+            "--hesap" | "--profile" => {
+                if let Some(v) = it.next() {
+                    return Cli::Name(v.clone());
+                }
+            }
+            _ => {
+                if let Some(v) = a.strip_prefix("--hesap=") {
+                    return Cli::Name(v.to_string());
+                }
+            }
+        }
+    }
+    Cli::None
+}
+
+struct Picker {
+    profiles: Vec<ProfileInfo>,
+    new_name: String,
+    message: Option<String>,
+    refreshed: Instant,
+}
+
+pub struct Root {
+    root_dir: PathBuf,
+    chat: Option<LanChatApp>,
+    picker: Picker,
+    title_set: bool,
+}
+
+impl Root {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        app::setup_style(&cc.egui_ctx);
+        let root_dir = storage::root_dir();
+        let mut root = Root {
+            picker: Picker {
+                profiles: storage::list_profiles(&root_dir),
+                new_name: String::new(),
+                message: None,
+                refreshed: Instant::now(),
+            },
+            root_dir,
+            chat: None,
+            title_set: false,
+        };
+        root.startup(&cc.egui_ctx);
+        root
+    }
+
+    fn startup(&mut self, ctx: &egui::Context) {
+        let profiles = self.picker.profiles.clone();
+        let find_name = |n: &str| {
+            profiles
+                .iter()
+                .find(|p| p.name.to_lowercase() == n.trim().to_lowercase())
+                .cloned()
+        };
+        match parse_cli() {
+            Cli::Id(id) => match profiles.iter().find(|p| p.id == id) {
+                Some(p) => self.try_open(ctx, &p.clone()),
+                None => self.picker.message = Some("İstenen hesap bulunamadı".into()),
+            },
+            Cli::Name(name) => match find_name(&name) {
+                Some(p) => self.try_open(ctx, &p),
+                None => self.create_and_open(ctx, &name),
+            },
+            Cli::None => {
+                if profiles.is_empty() {
+                    // İlk açılış: bilgisayar adıyla bir hesap oluştur
+                    self.create_and_open(ctx, "");
+                    return;
+                }
+                // Son kullanılan (yoksa ilk) hesap boştaysa doğrudan onu aç;
+                // zaten açıksa hesap seçme ekranını göster.
+                let last = storage::last_profile(&self.root_dir);
+                let preferred = last
+                    .and_then(|id| profiles.iter().find(|p| p.id == id).cloned())
+                    .unwrap_or_else(|| profiles[0].clone());
+                if !preferred.in_use {
+                    self.try_open(ctx, &preferred);
+                } else if profiles.len() > 1 {
+                    self.picker.message = Some(format!(
+                        "“{}” başka bir pencerede açık. Hangi hesapla devam edilsin?",
+                        preferred.name
+                    ));
+                } else {
+                    self.picker.message = Some(format!(
+                        "“{}” başka bir pencerede açık. Bu pencerede kullanmak için yeni bir hesap oluşturun.",
+                        preferred.name
+                    ));
+                }
+            }
+        }
+    }
+
+    fn try_open(&mut self, ctx: &egui::Context, p: &ProfileInfo) {
+        match storage::open_profile(&p.dir) {
+            Ok(profile) => {
+                self.chat = Some(LanChatApp::new(ctx, self.root_dir.clone(), profile));
+            }
+            Err(e) => {
+                self.picker.message = Some(match e {
+                    ProfileError::InUse => format!("“{}” başka bir pencerede zaten açık", p.name),
+                    other => other.to_string(),
+                });
+                self.picker.profiles = storage::list_profiles(&self.root_dir);
+            }
+        }
+    }
+
+    fn create_and_open(&mut self, ctx: &egui::Context, name: &str) {
+        match storage::create_profile(&self.root_dir, name) {
+            Ok(p) => self.try_open(ctx, &p),
+            Err(e) => self.picker.message = Some(format!("Hesap oluşturulamadı: {e}")),
+        }
+    }
+
+    fn picker_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if !self.title_set {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("LanChat — hesap seç".into()));
+            self.title_set = true;
+        }
+        // Başka pencerelerdeki hesapların açık/kapalı durumu değişebilir
+        ctx.request_repaint_after(Duration::from_secs(2));
+        if self.picker.refreshed.elapsed() >= Duration::from_secs(2) {
+            self.picker.profiles = storage::list_profiles(&self.root_dir);
+            self.picker.refreshed = Instant::now();
+        }
+
+        let mut open: Option<ProfileInfo> = None;
+        let mut create: Option<String> = None;
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(RichText::new("💬 LanChat").size(26.0).strong());
+                ui.add_space(4.0);
+                ui.label(RichText::new("Hangi hesapla açılsın?").size(16.0));
+                ui.add_space(12.0);
+                if let Some(m) = &self.picker.message {
+                    ui.label(RichText::new(m).color(Color32::from_rgb(234, 88, 12)));
+                    ui.add_space(8.0);
+                }
+            });
+
+            let width = 380.0f32.min(ui.available_width());
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 0.0),
+                Layout::top_down(Align::Center),
+                |ui| {
+                    ui.set_max_width(width);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(width);
+                        if self.picker.profiles.is_empty() {
+                            ui.label(RichText::new("Henüz hesap yok").weak());
+                        }
+                        for p in &self.picker.profiles {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&p.name).size(15.0));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if p.in_use {
+                                        ui.label(
+                                            RichText::new("başka pencerede açık").small().weak(),
+                                        );
+                                    } else if ui.button(RichText::new("Aç").strong()).clicked() {
+                                        open = Some(p.clone());
+                                    }
+                                });
+                            });
+                            ui.separator();
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Yeni hesap").strong());
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                TextEdit::singleline(&mut self.picker.new_name)
+                                    .hint_text("ör. Kamil – Kişisel")
+                                    .char_limit(40)
+                                    .desired_width(width - 110.0),
+                            );
+                            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            if (ui.button("➕ Oluştur").clicked() || enter)
+                                && !self.picker.new_name.trim().is_empty()
+                            {
+                                create = Some(self.picker.new_name.trim().to_string());
+                            }
+                        });
+                    });
+                },
+            );
+        });
+
+        if let Some(p) = open {
+            self.try_open(&ctx, &p);
+        } else if let Some(name) = create {
+            self.picker.new_name.clear();
+            self.create_and_open(&ctx, &name);
+        }
+    }
+}
+
+impl eframe::App for Root {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(chat) = &mut self.chat {
+            chat.logic(ctx, frame);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        match &mut self.chat {
+            Some(chat) => chat.ui(ui, frame),
+            None => self.picker_ui(ui),
+        }
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(chat) = &mut self.chat {
+            chat.on_exit();
+        }
+    }
+}

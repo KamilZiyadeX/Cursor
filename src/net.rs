@@ -80,6 +80,20 @@ pub struct NetOptions {
     pub tcp_port: u16,
     pub discovery_port: u16,
     pub manual_ips: Vec<IpAddr>,
+    /// Aynı bilgisayardaki diğer LanChat hesaplarıyla paylaşılan klasör.
+    /// Her hesap buraya adını ve portunu yazar; böylece aynı bilgisayardaki
+    /// hesaplar ağ yayınına güvenmeden birbirini bulur.
+    pub local_registry: Option<PathBuf>,
+}
+
+/// Aynı bilgisayardaki bir hesabın `local_registry` kaydı.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LocalRegistryEntry {
+    id: String,
+    name: String,
+    port: u16,
+    /// Son güncelleme (Unix saniyesi)
+    ts: i64,
 }
 
 /// Arayüzün ağla konuştuğu tutamaç. Klonlanabilir.
@@ -100,6 +114,9 @@ struct Inner {
     discovery_error: Option<String>,
     /// Sürmekte olan aktarımların iptal işaretleri
     active: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    local_registry: Option<PathBuf>,
+    /// Aynı bilgisayarda açık olan diğer hesapların kimlikleri
+    local_ids: Mutex<HashSet<String>>,
 }
 
 /// Gönderilecek bir öğe.
@@ -140,8 +157,17 @@ impl Net {
         opts: NetOptions,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> io::Result<(Net, Receiver<NetEvent>)> {
-        let listener = TcpListener::bind(("0.0.0.0", opts.tcp_port))
-            .or_else(|_| TcpListener::bind(("0.0.0.0", 0)))?;
+        // Aynı bilgisayarda birden çok hesap açıksa sıradaki portları dene
+        let listener = if opts.tcp_port == 0 {
+            TcpListener::bind(("0.0.0.0", 0))?
+        } else {
+            match (0..10u16)
+                .find_map(|i| TcpListener::bind(("0.0.0.0", opts.tcp_port.saturating_add(i))).ok())
+            {
+                Some(l) => l,
+                None => TcpListener::bind(("0.0.0.0", 0))?,
+            }
+        };
         let tcp_port = listener.local_addr()?.port();
 
         let (udp, discovery_error) = match bind_discovery(opts.discovery_port) {
@@ -163,6 +189,8 @@ impl Net {
                 unicast_targets: Mutex::new(opts.manual_ips.into_iter().collect()),
                 discovery_error,
                 active: Mutex::new(HashMap::new()),
+                local_registry: opts.local_registry,
+                local_ids: Mutex::new(HashSet::new()),
             }),
         };
 
@@ -186,6 +214,13 @@ impl Net {
         }
 
         thread::spawn(move || remove_stale_partials(&download_dir));
+
+        if net.inner.local_registry.is_some() {
+            let n = net.clone();
+            thread::Builder::new()
+                .name("local-registry".into())
+                .spawn(move || n.local_registry_loop())?;
+        }
 
         Ok((net, rx))
     }
@@ -241,6 +276,76 @@ impl Net {
         (self.inner.notify)();
     }
 
+    /// Uygulama kapanırken çağrılır: bu hesabın yerel kaydını siler.
+    pub fn shutdown(&self) {
+        if let Some(dir) = &self.inner.local_registry {
+            let _ = fs::remove_file(dir.join(format!("{}.json", self.inner.my_id)));
+        }
+    }
+
+    /// Aynı bilgisayardaki hesapları ortak klasör üzerinden duyurur ve bulur.
+    fn local_registry_loop(&self) {
+        let Some(dir) = self.inner.local_registry.clone() else {
+            return;
+        };
+        let _ = fs::create_dir_all(&dir);
+        let own = dir.join(format!("{}.json", self.inner.my_id));
+        loop {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let entry = LocalRegistryEntry {
+                id: self.inner.my_id.clone(),
+                name: self.inner.name.read().unwrap().clone(),
+                port: self.inner.tcp_port,
+                ts: now,
+            };
+            if let Ok(json) = serde_json::to_vec(&entry) {
+                let tmp = own.with_extension("tmp");
+                if fs::write(&tmp, json).is_ok() {
+                    let _ = fs::rename(&tmp, &own);
+                }
+            }
+
+            let mut seen = HashSet::new();
+            for e in fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+            {
+                let path = e.path();
+                if path == own || path.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                let Some(other) = fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<LocalRegistryEntry>(&b).ok())
+                else {
+                    continue;
+                };
+                if now - other.ts > 15 {
+                    // Kapanmış (ya da çökmüş) bir hesabın eski kaydı
+                    if now - other.ts > 3600 {
+                        let _ = fs::remove_file(&path);
+                    }
+                    continue;
+                }
+                if other.id == self.inner.my_id {
+                    continue;
+                }
+                seen.insert(other.id.clone());
+                self.emit(NetEvent::PeerSeen {
+                    id: other.id,
+                    name: other.name,
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), other.port),
+                });
+            }
+            *self.inner.local_ids.lock().unwrap() = seen;
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+
     fn me(&self) -> protocol::From {
         protocol::From {
             id: self.inner.my_id.clone(),
@@ -280,7 +385,7 @@ impl Net {
             let Some(b) = Beacon::parse(&buf[..n]) else {
                 continue;
             };
-            if b.id == self.inner.my_id {
+            if b.id == self.inner.my_id || self.inner.local_ids.lock().unwrap().contains(&b.id) {
                 continue;
             }
             // Karşı tarafa da doğrudan duyuru gönder: yayın tek yönlü
@@ -955,6 +1060,7 @@ mod tests {
                 // Testlerde keşif portunu çakıştırmamak için rastgele bir port
                 discovery_port: 0,
                 manual_ips: vec![],
+                local_registry: None,
             },
             || {},
         )
@@ -1008,6 +1114,61 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn two_accounts_on_same_pc_find_each_other() {
+        let root = temp_dir("same-pc");
+        let registry = root.join("online");
+        // Aynı tercih edilen port: ikinci hesap bir sonrakine geçmeli
+        let base = TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let open = |id: &str| {
+            Net::start(
+                NetOptions {
+                    my_id: id.into(),
+                    name: format!("Hesap {id}"),
+                    download_dir: root.join(id),
+                    tcp_port: base,
+                    discovery_port: 0,
+                    manual_ips: vec![],
+                    local_registry: Some(registry.clone()),
+                },
+                || {},
+            )
+            .unwrap()
+        };
+        let (a, rx_a) = open("is");
+        let (b, rx_b) = open("kisisel");
+        assert_ne!(a.tcp_port(), b.tcp_port());
+
+        let NetEvent::PeerSeen { id, name, addr } = wait_for(
+            &rx_a,
+            |e| matches!(e, NetEvent::PeerSeen { id, .. } if id == "kisisel"),
+        ) else {
+            unreachable!()
+        };
+        assert_eq!((id.as_str(), name.as_str()), ("kisisel", "Hesap kisisel"));
+        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], b.tcp_port())));
+        wait_for(
+            &rx_b,
+            |e| matches!(e, NetEvent::PeerSeen { id, .. } if id == "is"),
+        );
+
+        a.send_text(addr, "m1".into(), "Aynı bilgisayardan selam".into());
+        wait_for(
+            &rx_b,
+            |e| matches!(e, NetEvent::IncomingText { text, .. } if text == "Aynı bilgisayardan selam"),
+        );
+        completed(&rx_a, "m1");
+
+        // Kapanan hesabın kaydı silinir
+        b.shutdown();
+        assert!(!registry.join("kisisel.json").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

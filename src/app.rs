@@ -2,7 +2,7 @@
 
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
 use crate::protocol;
-use crate::storage::{Body, ChatMessage, Config, History, KnownPeer, MsgState};
+use crate::storage::{self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Profile};
 use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
@@ -31,6 +31,12 @@ impl Peer {
     }
 }
 
+struct NewAccount {
+    name: String,
+    error: Option<String>,
+    focused: bool,
+}
+
 struct Settings {
     name: String,
     download_dir: PathBuf,
@@ -40,8 +46,14 @@ struct Settings {
 }
 
 pub struct LanChatApp {
+    /// Tüm hesapların bulunduğu kök klasör
+    root_dir: PathBuf,
+    /// Bu hesabın klasörü
     data_dir: PathBuf,
     cfg: Config,
+    /// Açık hesap; kilidi pencere kapanana kadar tutar
+    _profile: Profile,
+    new_account: Option<NewAccount>,
     net: Option<Net>,
     rx: Option<Receiver<NetEvent>>,
     startup_error: Option<String>,
@@ -61,14 +73,14 @@ pub struct LanChatApp {
 }
 
 impl LanChatApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        setup_style(&cc.egui_ctx);
-
-        let data_dir = crate::storage::data_dir();
-        let cfg = Config::load_or_create(&data_dir);
+    pub fn new(ctx: &egui::Context, root_dir: PathBuf, profile: Profile) -> Self {
+        let data_dir = profile.dir.clone();
+        let cfg = profile.cfg.clone();
         let history = History::load(&data_dir);
+        let _ = storage::set_last_profile(&root_dir, &cfg.id);
 
-        let ctx = cc.egui_ctx.clone();
+        let local_registry = Some(storage::online_dir(&root_dir));
+        let ctx = ctx.clone();
         let tcp_port = std::env::var("LANCHAT_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -81,6 +93,7 @@ impl LanChatApp {
                 tcp_port,
                 discovery_port: protocol::DISCOVERY_PORT,
                 manual_ips: cfg.manual_ips.iter().filter_map(|s| parse_ip(s)).collect(),
+                local_registry,
             },
             move || ctx.request_repaint(),
         );
@@ -102,8 +115,11 @@ impl LanChatApp {
         let selected = history.messages.last().map(|m| m.peer_id.clone());
 
         Self {
+            root_dir,
             data_dir,
             cfg,
+            _profile: profile,
+            new_account: None,
             net,
             rx,
             startup_error,
@@ -415,6 +431,7 @@ impl LanChatApp {
             ui.separator();
             ui.label(RichText::new(format!("Adın: {}", self.cfg.name)).weak());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.menu_button("👤 Hesaplar", |ui| self.accounts_menu(ui));
                 if ui.button("⚙ Ayarlar").clicked() {
                     self.settings = Some(Settings {
                         name: self.cfg.name.clone(),
@@ -434,6 +451,104 @@ impl LanChatApp {
                 }
             });
         });
+    }
+
+    fn accounts_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(format!("Bu pencere: {}", self.cfg.name)).strong());
+        ui.separator();
+        let others: Vec<_> = storage::list_profiles(&self.root_dir)
+            .into_iter()
+            .filter(|p| p.id != self.cfg.id)
+            .collect();
+        if others.is_empty() {
+            ui.label(RichText::new("Başka hesap yok").weak());
+        }
+        for p in others {
+            let label = if p.in_use {
+                format!("🗗 {}  (açık)", p.name)
+            } else {
+                format!("🗗 {}", p.name)
+            };
+            let resp = ui
+                .add_enabled(!p.in_use, egui::Button::new(label))
+                .on_hover_text("Bu hesabı yeni bir pencerede aç")
+                .on_disabled_hover_text("Bu hesap başka bir pencerede zaten açık");
+            if resp.clicked() {
+                ui.close();
+                if let Err(e) = open_account_window(&p.id) {
+                    self.show_toast(format!("Yeni pencere açılamadı: {e}"));
+                }
+            }
+        }
+        ui.separator();
+        if ui.button("➕ Yeni hesap…").clicked() {
+            ui.close();
+            self.new_account = Some(NewAccount {
+                name: String::new(),
+                error: None,
+                focused: false,
+            });
+        }
+    }
+
+    fn new_account_window(&mut self, ctx: &egui::Context) {
+        let Some(na) = &mut self.new_account else {
+            return;
+        };
+        let mut create = false;
+        let mut close = false;
+        egui::Window::new("Yeni hesap")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Yeni hesap ayrı bir pencerede açılır; kendi adı, sohbet geçmişi ve indirme klasörü olur.");
+                ui.add_space(6.0);
+                let r = ui.add(
+                    TextEdit::singleline(&mut na.name)
+                        .hint_text("Hesap adı (ör. “Kamil – Kişisel”)")
+                        .char_limit(40)
+                        .desired_width(f32::INFINITY),
+                );
+                if !na.focused {
+                    r.request_focus();
+                    na.focused = true;
+                }
+                if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    create = true;
+                }
+                if let Some(e) = &na.error {
+                    ui.colored_label(Color32::from_rgb(220, 38, 38), e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Oluştur ve aç").strong()).clicked() {
+                        create = true;
+                    }
+                    if ui.button("İptal").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if create {
+            let name = na.name.trim().to_string();
+            if name.is_empty() {
+                na.error = Some("Bir ad yazın".into());
+                return;
+            }
+            let result = storage::create_profile(&self.root_dir, &name)
+                .map_err(|e| e.to_string())
+                .and_then(|p| open_account_window(&p.id).map_err(|e| e.to_string()));
+            match result {
+                Ok(()) => {
+                    self.new_account = None;
+                    self.show_toast(format!("“{name}” hesabı yeni pencerede açılıyor…"));
+                }
+                Err(e) => na.error = Some(e),
+            }
+        } else if close {
+            self.new_account = None;
+        }
     }
 
     fn peer_list(&mut self, ui: &mut egui::Ui) {
@@ -1024,9 +1139,9 @@ impl eframe::App for LanChatApp {
         }
         let total: usize = self.unread.values().sum();
         let title = if total > 0 {
-            format!("({total}) LanChat")
+            format!("({total}) LanChat — {}", self.cfg.name)
         } else {
-            "LanChat".to_string()
+            format!("LanChat — {}", self.cfg.name)
         };
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1074,17 +1189,31 @@ impl eframe::App for LanChatApp {
             .show(ui, |ui| self.chat(ui));
 
         self.settings_window(&ctx);
+        self.new_account_window(&ctx);
         self.overlays(&ctx);
     }
 
     fn on_exit(&mut self) {
         self.save_history();
+        if let Some(net) = &self.net {
+            net.shutdown();
+        }
     }
 }
 
 /* ------------------------------ Yardımcılar ------------------------------ */
 
-fn setup_style(ctx: &egui::Context) {
+/// Verilen hesabı yeni bir LanChat penceresinde (ayrı işlem olarak) açar.
+pub fn open_account_window(profile_id: &str) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("--hesap-id")
+        .arg(profile_id)
+        .spawn()
+        .map(|_| ())
+}
+
+pub fn setup_style(ctx: &egui::Context) {
     ctx.global_style_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
