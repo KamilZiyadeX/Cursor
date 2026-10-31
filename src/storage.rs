@@ -78,6 +78,9 @@ pub struct ChatMessage {
     /// Herkesten silindi (içerik temizlenir, "Bu mesaj silindi" gösterilir)
     #[serde(default)]
     pub deleted: bool,
+    /// "Herkese" gönderilen mesajın kişilere giden kopyaları (mesaj kimlikleri)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
     /// Aktarılan bayt (yalnızca aktarım sürerken anlamlı)
     #[serde(skip)]
     pub progress: u64,
@@ -99,6 +102,7 @@ impl ChatMessage {
             read_sent: false,
             reply_to: None,
             deleted: false,
+            children: Vec::new(),
             progress: 0,
             speed: Speed::default(),
         }
