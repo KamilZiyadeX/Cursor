@@ -1719,7 +1719,7 @@ pub fn small_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
     load_png_texture(
         ctx,
         "lanchat-logo-small",
-        include_bytes!("../assets/icon/lanchat-48.png"),
+        include_bytes!("../assets/icon/lanchat-small-48.png"),
     )
 }
 

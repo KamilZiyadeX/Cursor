@@ -162,5 +162,6 @@ Gelen dosyalar otomatik kaydedilir ama otomatik açılmaz. Eşleştirdiğiniz ki
 Kapo PDF ile aynı aileden: parlak kırmızı zemin, üst üste duran beyaz konuşma balonları, sol üstte kırmızı **LAN** etiketi ve ortada **K-A-P-O** ağı.
 
 - `assets/logo/lanchat.svg`: 64 px ve üstü için ayrıntılı çizim (harfler *Archivo Black* yazı tipiyle).
-- `assets/logo/lanchat-16.svg`, `-24`, `-32`, `-48`: küçük boyutlar için piksel ızgarasına göre ayrı ayrı çizilmiş sade sürümler.
+- `assets/logo/lanchat-medium.svg`: masaüstü boyutları (40 ve 48 px) için; düğümler ve harfler daha büyük.
+- `assets/logo/lanchat-16.svg`, `-24`, `-32`: pencere başlığı ve görev çubuğu gibi küçük yerler için piksel ızgarasına göre çizilmiş sade sürümler (`lanchat-small-48.svg` uygulama içi üst çubukta kullanılır).
 - `assets/icon/`: bu çizimlerden üretilmiş PNG'ler ve hepsini içeren `lanchat.ico`. Pencere simgesi, uygulama içi logo ve Windows'ta `.exe` simgesi buradan alınır.
