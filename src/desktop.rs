@@ -177,10 +177,9 @@ mod imp {
 
     static APP_ID: Mutex<Option<String>> = Mutex::new(None);
 
-    /// Başlat menüsüne, bildirimler için gereken uygulama kimliğini (AUMID)
-    /// taşıyan bir LanChat kısayolu koyar. Windows, kurulum yapılmamış
-    /// programların bildirimlerini ancak böyle bir kısayol varsa gösterir.
-    fn ensure_start_menu_shortcut() -> windows::core::Result<()> {
+    /// LanChat programını gösteren bir kısayol (.lnk) kaydeder. Kısayol, bildirimler
+    /// için gereken uygulama kimliğini (AUMID) de taşır.
+    fn save_shortcut(lnk: &Path, args: &str, description: &str) -> windows::core::Result<()> {
         use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
         use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
         use windows::Win32::System::Com::{
@@ -192,24 +191,25 @@ mod imp {
         use windows::Win32::UI::Shell::{IShellLinkW, SHStrDupW, ShellLink};
         use windows::core::{HSTRING, Interface};
 
-        let (Ok(exe), Ok(appdata)) = (std::env::current_exe(), std::env::var("APPDATA")) else {
+        let Ok(exe) = std::env::current_exe() else {
             return Ok(());
         };
-        let dir = Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs");
-        let _ = std::fs::create_dir_all(&dir);
-        let lnk = dir.join("LanChat.lnk");
+        if let Some(dir) = lnk.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         // SAFETY: COM nesneleri bu iş parçacığında oluşturulup burada kullanılır;
         // PROPVARIANT'ın metni SHStrDupW ile ayrılır ve PropVariantClear ile serbest bırakılır.
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             link.SetPath(&HSTRING::from(exe.as_os_str()))?;
+            if !args.is_empty() {
+                link.SetArguments(&HSTRING::from(args))?;
+            }
             if let Some(parent) = exe.parent() {
                 link.SetWorkingDirectory(&HSTRING::from(parent.as_os_str()))?;
             }
-            link.SetDescription(&HSTRING::from(
-                "LanChat: aynı ağdaki bilgisayarlar arasında mesaj ve dosya",
-            ))?;
+            link.SetDescription(&HSTRING::from(description))?;
             let store: IPropertyStore = link.cast()?;
             let mut pv = PROPVARIANT::default();
             (*pv.Anonymous.Anonymous).vt = VT_LPWSTR;
@@ -225,6 +225,29 @@ mod imp {
         Ok(())
     }
 
+    /// Başlat menüsüne LanChat kısayolu koyar. Windows, kurulum yapılmamış
+    /// programların bildirimlerini ancak böyle bir kısayol varsa gösterir.
+    fn ensure_start_menu_shortcut() -> windows::core::Result<()> {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return Ok(());
+        };
+        let lnk = Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\LanChat.lnk");
+        save_shortcut(
+            &lnk,
+            "",
+            "LanChat: aynı ağdaki bilgisayarlar arasında mesaj ve dosya",
+        )
+    }
+
+    /// Dosya Gezgini'nde sağ tık → Gönder → LanChat
+    fn ensure_send_to_shortcut() -> windows::core::Result<()> {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return Ok(());
+        };
+        let lnk = Path::new(&appdata).join(r"Microsoft\Windows\SendTo\LanChat.lnk");
+        save_shortcut(&lnk, "--gonder", "Seçilen dosyaları LanChat ile gönder")
+    }
+
     /// Bildirimlerin çıkabilmesi için gerekenleri hazırlar (açılışta, arka planda).
     pub fn init_notifications(icon_dir: &Path) {
         let _ = app_id(icon_dir);
@@ -237,6 +260,7 @@ mod imp {
             return id.clone();
         }
         let _ = ensure_start_menu_shortcut();
+        let _ = ensure_send_to_shortcut();
         let icon = icon_dir.join("lanchat-bildirim.png");
         let _ = std::fs::create_dir_all(icon_dir);
         let _ = std::fs::write(

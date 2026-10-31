@@ -162,6 +162,8 @@ pub struct LanChatApp {
     last_queue_check: Instant,
     /// Yapıştırılan resmin önizlemesi: (sohbet, resim, doku)
     paste_preview: Option<(String, egui::ColorImage, egui::TextureHandle)>,
+    /// Dosya Gezgini'nden "Gönder → LanChat" ile gelen, kime gideceği sorulan dosyalar
+    send_choice: Option<Vec<PathBuf>>,
     /// Açık arama: (hangi sohbette, aranan metin)
     search: Option<(String, String)>,
     /// Arama kutusuna odaklanılsın mı (bir kerelik)
@@ -296,6 +298,7 @@ impl LanChatApp {
             last_flush: HashMap::new(),
             last_queue_check: Instant::now(),
             paste_preview: None,
+            send_choice: None,
             search: None,
             search_focus: false,
             thumbs: HashMap::new(),
@@ -466,6 +469,11 @@ impl LanChatApp {
         if self.last_show_check.elapsed() >= Duration::from_millis(700) {
             self.last_show_check = Instant::now();
             if storage::take_show_request(&self.data_dir) {
+                self.show_window(ctx);
+            }
+            let paths = storage::take_send_requests(&self.data_dir);
+            if !paths.is_empty() {
+                self.send_choice.get_or_insert_with(Vec::new).extend(paths);
                 self.show_window(ctx);
             }
         }
@@ -1127,6 +1135,95 @@ impl LanChatApp {
             egui::TextureOptions::LINEAR,
         );
         self.paste_preview = Some((chat, img, tex));
+    }
+
+    /// "Gönder → LanChat" ile gelen dosyalar için kişi seçme penceresi.
+    fn send_choice_window(&mut self, ctx: &egui::Context) {
+        let Some(paths) = &self.send_choice else {
+            return;
+        };
+        let mut targets: Vec<(String, String, bool)> = self.broadcast_targets();
+        targets.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        let mut chosen: Option<String> = None;
+        let mut cancel = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        egui::Window::new("Kime gönderilsin?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let names: Vec<String> = paths
+                    .iter()
+                    .map(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string())
+                    })
+                    .collect();
+                let summary = match names.len() {
+                    1 => format!("“{}”", names[0]),
+                    n => format!("{n} öğe ({}…)", names[0]),
+                };
+                ui.label(RichText::new(summary).strong());
+                ui.add_space(6.0);
+                if targets.is_empty() {
+                    ui.label(RichText::new("Henüz eşleştiğiniz bir cihaz yok.").weak());
+                }
+                ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    if targets.len() > 1
+                        && ui
+                            .add_sized([280.0, 30.0], egui::Button::new("📢 Herkese"))
+                            .clicked()
+                    {
+                        chosen = Some(BROADCAST.to_string());
+                    }
+                    for (id, name, online) in &targets {
+                        let dot = if *online {
+                            Color32::from_rgb(34, 197, 94)
+                        } else {
+                            Color32::GRAY
+                        };
+                        let mut label = egui::text::LayoutJob::default();
+                        label.append(
+                            "● ",
+                            0.0,
+                            egui::TextFormat::simple(FontId::proportional(14.0), dot),
+                        );
+                        label.append(
+                            name,
+                            0.0,
+                            egui::TextFormat::simple(
+                                FontId::proportional(15.0),
+                                ui.visuals().text_color(),
+                            ),
+                        );
+                        let b = ui
+                            .add_sized([280.0, 30.0], egui::Button::new(label))
+                            .on_hover_text(if *online {
+                                "Çevrimiçi: hemen gönderilir"
+                            } else {
+                                "Çevrimdışı: çevrimiçi olunca gönderilir"
+                            });
+                        if b.clicked() {
+                            chosen = Some(id.clone());
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                if ui.button("Vazgeç").clicked() {
+                    cancel = true;
+                }
+            });
+        if let Some(id) = chosen {
+            let paths = self.send_choice.take().unwrap_or_default();
+            self.unread.remove(&id);
+            self.selected = Some(id);
+            self.send_paths(paths);
+        } else if cancel {
+            self.send_choice = None;
+        }
     }
 
     fn paste_preview_window(&mut self, ctx: &egui::Context) {
@@ -3639,6 +3736,9 @@ impl eframe::App for LanChatApp {
         }
         if self.paste_preview.is_some() {
             self.paste_preview_window(&ctx);
+        }
+        if self.send_choice.is_some() {
+            self.send_choice_window(&ctx);
         }
 
         egui::Panel::top("top").show(ui, |ui| {

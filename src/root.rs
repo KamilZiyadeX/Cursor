@@ -5,6 +5,8 @@
 //!   lanchat --hesap-id <kimlik>    (uygulamanın kendi kullandığı) kimlikle açar
 //!   --guncelleme                   güncelleme sonrası: eski sürümün kapanmasını bekler
 //!   --arka-plan                    pencereyi göstermeden, tepside başlar (Windows açılışı)
+//!   --gonder <dosyalar…>           dosyaları gönderir: kime gönderileceği sorulur
+//!                                  (Dosya Gezgini → Gönder → LanChat bunu kullanır)
 //!
 //! İstenen hesap başka bir pencerede zaten açıksa (tepside gizli olabilir) o
 //! pencere öne getirilir ve bu yeni işlem kapanır.
@@ -20,6 +22,16 @@ enum Cli {
     None,
     Name(String),
     Id(String),
+}
+
+/// `--gonder` ile verilen dosya ve klasörler
+fn send_paths_from_args() -> Vec<PathBuf> {
+    std::env::args()
+        .skip_while(|a| a != "--gonder")
+        .skip(1)
+        .take_while(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn parse_cli() -> Cli {
@@ -76,6 +88,8 @@ pub struct Root {
     picker: Picker,
     title_set: bool,
     logo: egui::TextureHandle,
+    /// `--gonder` ile gelen dosyalar (açılacak hesaba iletilir)
+    send: Vec<PathBuf>,
 }
 
 impl Root {
@@ -94,6 +108,7 @@ impl Root {
             unlock: None,
             title_set: false,
             logo: app::large_logo_texture(&cc.egui_ctx),
+            send: send_paths_from_args(),
         };
         root.startup(&cc.egui_ctx);
         root
@@ -152,6 +167,12 @@ impl Root {
     }
 
     fn try_open(&mut self, ctx: &egui::Context, p: &ProfileInfo) {
+        // Gönderilecek dosyalar varsa hesaba bırak: hesap açıksa o pencere, değilse
+        // birazdan açılacak bu pencere alır.
+        let send = std::mem::take(&mut self.send);
+        if !send.is_empty() {
+            let _ = storage::request_send(&p.dir, &send);
+        }
         match storage::open_profile(&p.dir) {
             Ok(locked) if locked.has_password() => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(

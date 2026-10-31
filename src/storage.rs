@@ -71,6 +71,37 @@ pub fn request_show(profile_dir: &Path) {
     let _ = fs::write(profile_dir.join(SHOW_REQUEST), b"");
 }
 
+/// Açık olan (ya da açılacak) hesaba "bu dosyaları gönder" isteği bırakır
+/// (Dosya Gezgini → Gönder → LanChat).
+pub fn request_send(profile_dir: &Path, paths: &[PathBuf]) -> io::Result<()> {
+    let name = format!("gonder-{}.json", uuid::Uuid::new_v4().simple());
+    let tmp = profile_dir.join(format!("{name}.tmp"));
+    fs::write(&tmp, serde_json::to_vec(paths)?)?;
+    fs::rename(tmp, profile_dir.join(name))
+}
+
+/// Bekleyen "gönder" isteklerindeki dosyalar (istekler silinir).
+pub fn take_send_requests(profile_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(profile_dir) else {
+        return out;
+    };
+    for e in rd.filter_map(Result::ok) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("gonder-") && name.ends_with(".json") {
+            if let Ok(paths) = fs::read(e.path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<PathBuf>>(&b).ok())
+                .ok_or(())
+            {
+                out.extend(paths);
+            }
+            let _ = fs::remove_file(e.path());
+        }
+    }
+    out
+}
+
 /// Bu hesap için "öne gel" isteği var mı? (varsa siler)
 pub fn take_show_request(profile_dir: &Path) -> bool {
     fs::remove_file(profile_dir.join(SHOW_REQUEST)).is_ok()
@@ -782,6 +813,26 @@ mod tests {
         drop(opened);
         assert!(open_profile(&a.dir).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn send_requests_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("lanchat-gonder-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = vec![PathBuf::from("C:/a b/ç.txt"), PathBuf::from("/tmp/klasör")];
+        request_send(&dir, &a).unwrap();
+        request_send(&dir, &[PathBuf::from("/x")]).unwrap();
+        let mut got = take_send_requests(&dir);
+        got.sort();
+        let mut want = a.clone();
+        want.push(PathBuf::from("/x"));
+        want.sort();
+        assert_eq!(got, want);
+        assert!(
+            take_send_requests(&dir).is_empty(),
+            "istekler bir kez alınmalı"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
