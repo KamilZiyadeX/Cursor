@@ -72,6 +72,12 @@ pub struct ChatMessage {
     /// Gelen mesaj için "okundu" bilgisini gönderdik mi?
     #[serde(default)]
     pub read_sent: bool,
+    /// Bu mesaj başka bir mesaja yanıtsa, alıntı
+    #[serde(default)]
+    pub reply_to: Option<crate::protocol::ReplyRef>,
+    /// Herkesten silindi (içerik temizlenir, "Bu mesaj silindi" gösterilir)
+    #[serde(default)]
+    pub deleted: bool,
     /// Aktarılan bayt (yalnızca aktarım sürerken anlamlı)
     #[serde(skip)]
     pub progress: u64,
@@ -91,6 +97,8 @@ impl ChatMessage {
             note: None,
             read: false,
             read_sent: false,
+            reply_to: None,
+            deleted: false,
             progress: 0,
             speed: Speed::default(),
         }

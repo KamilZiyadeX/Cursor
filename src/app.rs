@@ -1,7 +1,7 @@
 //! Masaüstü arayüzü (egui).
 
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
-use crate::protocol;
+use crate::protocol::{self, ReplyRef};
 use crate::secure::PublicKey;
 use crate::storage::{
     self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Profile, TrustedPeer,
@@ -98,6 +98,8 @@ pub struct LanChatApp {
     typing: HashMap<String, Instant>,
     /// En son "yazıyor" bildirimini ne zaman gönderdik
     last_typing_sent: Option<Instant>,
+    /// Yanıtlanan mesaj (hangi sohbette, alıntı)
+    replying: Option<(String, ReplyRef)>,
     out_pair: Option<OutPair>,
     in_pair: Option<InPair>,
     net: Option<Net>,
@@ -173,6 +175,7 @@ impl LanChatApp {
             new_account: None,
             typing: HashMap::new(),
             last_typing_sent: None,
+            replying: None,
             out_pair: None,
             in_pair: None,
             net,
@@ -322,6 +325,17 @@ impl LanChatApp {
                 }
             }
             NetEvent::Notice { text } => self.show_toast(text),
+            NetEvent::Deleted { peer_id, msg_id } => {
+                // Yalnızca o kişinin bize gönderdiği mesaj silinebilir
+                if let Some(m) = self
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == msg_id && m.peer_id == peer_id && !m.outgoing)
+                {
+                    clear_message(m);
+                    self.dirty = true;
+                }
+            }
             NetEvent::Typing { peer_id } => {
                 self.typing
                     .insert(peer_id, Instant::now() + Duration::from_secs(5));
@@ -339,16 +353,20 @@ impl LanChatApp {
                 addr,
                 msg_id,
                 text,
+                reply_to,
             } => {
                 self.upsert_peer(&from.id, &from.name, addr, None);
                 self.typing.remove(&from.id);
-                self.push_message(ChatMessage::new(
-                    msg_id,
-                    from.id.clone(),
-                    false,
-                    Body::Text(text),
-                    MsgState::Done,
-                ));
+                self.push_message(ChatMessage {
+                    reply_to,
+                    ..ChatMessage::new(
+                        msg_id,
+                        from.id.clone(),
+                        false,
+                        Body::Text(text),
+                        MsgState::Done,
+                    )
+                });
                 self.on_incoming(ctx, &from.id);
             }
             NetEvent::IncomingTransfer {
@@ -510,6 +528,49 @@ impl LanChatApp {
         }
     }
 
+    fn start_reply(&mut self, msg_id: &str, peer_name: &str) {
+        let Some(m) = self.messages.iter().find(|m| m.id == msg_id) else {
+            return;
+        };
+        let preview = match &m.body {
+            Body::Text(t) => t.replace('\n', " "),
+            Body::File { name, .. } => format!("📄 {name}"),
+        };
+        let reply = ReplyRef {
+            id: m.id.clone(),
+            author: if m.outgoing {
+                self.cfg.name.clone()
+            } else {
+                peer_name.to_string()
+            },
+            preview: preview.chars().take(120).collect(),
+        };
+        self.replying = Some((m.peer_id.clone(), reply));
+    }
+
+    /// Gönderdiğimiz mesajı iki taraftan da siler.
+    fn delete_for_all(&mut self, msg_id: &str) {
+        let Some(m) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.id == msg_id && m.outgoing)
+        else {
+            return;
+        };
+        clear_message(m);
+        let peer_id = m.peer_id.clone();
+        self.dirty = true;
+        let addr = self.peer(&peer_id).and_then(|p| p.addr);
+        if let (Some(net), Some(addr), true) = (&self.net, addr, self.is_paired(&peer_id)) {
+            net.send_delete(addr, peer_id, msg_id.to_string());
+            self.show_toast("Mesaj iki taraftan da silindi");
+        } else {
+            self.show_toast(
+                "Mesaj sizden silindi; karşı taraf çevrimiçi olmadığı için onda kalabilir",
+            );
+        }
+    }
+
     /// Yazarken karşı tarafa en fazla 3 saniyede bir "yazıyor" bildirir.
     fn notify_typing(&mut self) {
         if self
@@ -595,14 +656,21 @@ impl LanChatApp {
             return;
         };
         let id = new_id();
-        self.push_message(ChatMessage::new(
-            id.clone(),
-            peer_id.clone(),
-            true,
-            Body::Text(text.clone()),
-            MsgState::Pending,
-        ));
-        net.send_text(addr, peer_id, id, text);
+        let reply_to = match self.replying.take() {
+            Some((p, r)) if p == peer_id => Some(r),
+            _ => None,
+        };
+        self.push_message(ChatMessage {
+            reply_to: reply_to.clone(),
+            ..ChatMessage::new(
+                id.clone(),
+                peer_id.clone(),
+                true,
+                Body::Text(text.clone()),
+                MsgState::Pending,
+            )
+        });
+        net.send_reply(addr, peer_id, id, text, reply_to);
         self.input.clear();
     }
 
@@ -658,7 +726,7 @@ impl LanChatApp {
             mm.speed.reset();
         }
         match m.body {
-            Body::Text(t) => net.send_text(addr, m.peer_id, m.id, t),
+            Body::Text(t) => net.send_reply(addr, m.peer_id, m.id, t, m.reply_to),
             Body::File { path: Some(p), .. } => net.send_path(addr, m.peer_id, m.id, p),
             Body::File { path: None, .. } => {}
         }
@@ -1036,6 +1104,38 @@ impl LanChatApp {
             && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter));
 
         ui.add_space(6.0);
+        let current = self.selected.clone();
+        let mut cancel_reply = false;
+        if let Some((p, r)) = &self.replying
+            && Some(p) == current.as_ref()
+        {
+            Frame::new()
+                .fill(ui.visuals().faint_bg_color)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("↩").strong());
+                        ui.label(RichText::new(&r.author).strong().small());
+                        ui.add(
+                            egui::Label::new(RichText::new(&r.preview).small().weak()).truncate(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .small_button("✖")
+                                .on_hover_text("Yanıtlamayı iptal et")
+                                .clicked()
+                            {
+                                cancel_reply = true;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(4.0);
+        }
+        if cancel_reply {
+            self.replying = None;
+        }
         ui.horizontal(|ui| {
             let mut picked: Option<Vec<PathBuf>> = None;
             ui.menu_button(RichText::new("📎").size(18.0), |ui| {
@@ -1222,6 +1322,12 @@ impl LanChatApp {
                     ui.ctx().copy_text(t);
                     self.show_toast("Kopyalandı");
                 }
+                Action::Reply(id) => self.start_reply(&id, &name),
+                Action::DeleteLocal(id) => {
+                    self.messages.retain(|m| m.id != id);
+                    self.dirty = true;
+                }
+                Action::DeleteForAll(id) => self.delete_for_all(&id),
             }
         }
     }
@@ -1504,6 +1610,17 @@ enum Action {
     Retry(String),
     Cancel(String),
     Copy(String),
+    Reply(String),
+    DeleteLocal(String),
+    DeleteForAll(String),
+}
+
+/// Silinen mesajın içeriğini temizler.
+fn clear_message(m: &mut ChatMessage) {
+    m.deleted = true;
+    m.body = Body::Text(String::new());
+    m.reply_to = None;
+    m.note = None;
 }
 
 fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>) {
@@ -1528,7 +1645,10 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
         } else {
             ui.add_space(6.0);
         }
-        let resp = Frame::new()
+        // Sağ tık menüsü için balonun tamamı tıklanabilir; içindeki düğmeler önceliklidir
+        let resp = ui
+            .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+        Frame::new()
             .fill(fill)
             .stroke(Stroke::new(
                 1.0,
@@ -1539,7 +1659,29 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
             .show(ui, |ui| {
                 ui.set_max_width(max_w);
                 ui.vertical(|ui| {
+                    if let Some(r) = &m.reply_to {
+                        Frame::new()
+                            .fill(ui.visuals().faint_bg_color.gamma_multiply(1.6))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(&r.author)
+                                        .small()
+                                        .strong()
+                                        .color(Color32::from_rgb(248, 113, 113)),
+                                );
+                                ui.add(
+                                    egui::Label::new(RichText::new(&r.preview).small().weak())
+                                        .truncate(),
+                                );
+                            });
+                        ui.add_space(2.0);
+                    }
                     match &m.body {
+                        _ if m.deleted => {
+                            ui.label(RichText::new("🚫 Bu mesaj silindi").italics().weak());
+                        }
                         Body::Text(t) => {
                             ui.add(egui::Label::new(RichText::new(t).size(15.0)).wrap());
                         }
@@ -1604,6 +1746,7 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
                         }
                     });
                 });
+            });
             })
             .response;
 
@@ -1613,14 +1756,36 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
             ui.ctx().request_repaint();
         }
 
-        if let Body::Text(t) = &m.body {
-            resp.context_menu(|ui| {
-                if ui.button("📋 Kopyala").clicked() {
+        resp.context_menu(|ui| {
+            if !m.deleted {
+                if ui.button("↩ Yanıtla").clicked() {
+                    actions.push(Action::Reply(m.id.clone()));
+                    ui.close();
+                }
+                if let Body::Text(t) = &m.body
+                    && ui.button("📋 Kopyala").clicked()
+                {
                     actions.push(Action::Copy(t.clone()));
                     ui.close();
                 }
-            });
-        }
+                ui.separator();
+            }
+            if ui.button("🗑 Benden sil").clicked() {
+                actions.push(Action::DeleteLocal(m.id.clone()));
+                ui.close();
+            }
+            if m.outgoing
+                && !m.deleted
+                && m.state == MsgState::Done
+                && ui
+                    .button("🗑 Herkesten sil")
+                    .on_hover_text("Karşı taraftan da silinir. Gönderilmiş dosyalar onun bilgisayarında kalır.")
+                    .clicked()
+            {
+                actions.push(Action::DeleteForAll(m.id.clone()));
+                ui.close();
+            }
+        });
     });
 }
 
@@ -1841,6 +2006,9 @@ pub fn open_account_window(profile_id: &str) -> std::io::Result<()> {
 
 pub fn setup_style(ctx: &egui::Context) {
     ctx.global_style_mut(|style| {
+        // Metinler fareyle seçilmez: mesaja sağ tıklanınca menü açılsın
+        // (kopyalama menüdeki "Kopyala" ile)
+        style.interaction.selectable_labels = false;
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
         for (ts, size) in [

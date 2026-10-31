@@ -83,7 +83,12 @@ pub enum Packet {
         from: From,
         msg_id: String,
         text: String,
+        /// Yanıtlanan mesaj (eski sürümler bu alanı göndermez)
+        #[serde(default)]
+        reply_to: Option<ReplyRef>,
     },
+    /// Gönderenin daha önce yolladığı bir mesajı iki taraftan da siler
+    Delete { from: From, msg_id: String },
     /// Eşleştirme isteği; alıcıda iki tarafın anahtarlarından türetilen kod gösterilir.
     PairRequest { from: From },
     /// Karşı taraf yazıyor (yanıt beklenmez)
@@ -100,6 +105,16 @@ pub enum Packet {
         total_size: u64,
         file_count: u64,
     },
+}
+
+/// Yanıtlanan mesaja kısa bir başvuru (alıntı olarak gösterilir).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReplyRef {
+    pub id: String,
+    /// Alıntılanan mesajın yazarı (görünen ad)
+    pub author: String,
+    /// Mesajın ilk birkaç satırı ya da dosya adı
+    pub preview: String,
 }
 
 /// Alıcının `Packet::PairRequest`'e yanıtı.

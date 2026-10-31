@@ -82,6 +82,12 @@ pub enum NetEvent {
         addr: SocketAddr,
         msg_id: String,
         text: String,
+        reply_to: Option<protocol::ReplyRef>,
+    },
+    /// Karşı taraf bize gönderdiği bir mesajı herkesten sildi
+    Deleted {
+        peer_id: String,
+        msg_id: String,
     },
     /// Dosya/klasör gelmeye başladı (ya da yarım kalan aktarım devam ediyor).
     IncomingTransfer {
@@ -587,7 +593,20 @@ impl Net {
                     });
                 }
             }
-            Packet::Text { from, msg_id, text } => {
+            Packet::Delete { from, msg_id } => {
+                if self.is_authorized(&from.id, &remote) {
+                    self.emit(NetEvent::Deleted {
+                        peer_id: from.id,
+                        msg_id,
+                    });
+                }
+            }
+            Packet::Text {
+                from,
+                msg_id,
+                text,
+                reply_to,
+            } => {
                 if from.id == self.inner.my_id {
                     return;
                 }
@@ -603,6 +622,7 @@ impl Net {
                     addr,
                     msg_id,
                     text,
+                    reply_to,
                 });
                 let _ = stream.write_all(&[ACK_OK]);
             }
@@ -863,13 +883,36 @@ impl Net {
         });
     }
 
+    /// Gönderdiğimiz bir mesajı karşı taraftan da siler.
+    pub fn send_delete(&self, addr: SocketAddr, peer_id: String, msg_id: String) {
+        let packet = Packet::Delete {
+            from: self.me(),
+            msg_id,
+        };
+        self.send_signal(addr, peer_id, packet);
+    }
+
+    #[cfg(test)]
     pub fn send_text(&self, addr: SocketAddr, peer_id: String, msg_id: String, text: String) {
+        self.send_reply(addr, peer_id, msg_id, text, None);
+    }
+
+    /// Metin mesajı gönderir; `reply_to` verilirse bir mesaja yanıt olarak.
+    pub fn send_reply(
+        &self,
+        addr: SocketAddr,
+        peer_id: String,
+        msg_id: String,
+        text: String,
+        reply_to: Option<protocol::ReplyRef>,
+    ) {
         let net = self.clone();
         thread::spawn(move || {
             let packet = Packet::Text {
                 from: net.me(),
                 msg_id: msg_id.clone(),
                 text,
+                reply_to,
             };
             let res = (|| {
                 let mut s = net.secure_connect(addr, Some(&peer_id))?;
@@ -1649,6 +1692,55 @@ mod tests {
     }
 
     #[test]
+    fn reply_and_delete_between_paired_peers() {
+        let d = temp_dir("rd");
+        let (a, rx_a) = start("A", &d);
+        let (b, rx_b) = start("B", &d);
+        pair_up(&a, "A", &b, "B");
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+
+        let quote = protocol::ReplyRef {
+            id: "orijinal".into(),
+            author: "Test B".into(),
+            preview: "Toplantı kaçta?".into(),
+        };
+        a.send_reply(
+            addr_b,
+            "B".into(),
+            "y1".into(),
+            "Saat 3'te".into(),
+            Some(quote.clone()),
+        );
+        let NetEvent::IncomingText { reply_to, text, .. } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingText { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(text, "Saat 3'te");
+        assert_eq!(reply_to, Some(quote));
+        completed(&rx_a, "y1");
+
+        a.send_delete(addr_b, "B".into(), "y1".into());
+        let NetEvent::Deleted { peer_id, msg_id } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::Deleted { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!((peer_id.as_str(), msg_id.as_str()), ("A", "y1"));
+
+        // Eşleşmemiş biri silme isteği gönderemez
+        let (c, _rx_c) = start("C", &d);
+        c.set_trusted(HashMap::from([("B".to_string(), b.public_key())]));
+        c.send_delete(addr_b, "B".into(), "y1".into());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            rx_b.try_iter()
+                .all(|e| !matches!(e, NetEvent::Deleted { .. }))
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
     fn unique_path_adds_suffix() {
         let d = temp_dir("uniq");
         fs::write(d.join("a.txt"), "x").unwrap();
@@ -1674,6 +1766,7 @@ mod tests {
                 text,
                 msg_id,
                 addr,
+                ..
             } => {
                 assert_eq!(from.id, "A");
                 assert_eq!(text, "Merhaba ğüşıöç 👋");
