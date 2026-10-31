@@ -1,0 +1,25 @@
+[package]
+name = "lanchat"
+version = "0.1.0"
+description = "Aynı yerel ağdaki bilgisayarlar arasında mesaj ve dosya gönderme uygulaması"
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+directories = "6.0.0"
+eframe = "0.37.0"
+gethostname = "1.1.0"
+if-addrs = "0.15.0"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+socket2 = { version = "0.6.5", features = ["all"] }
+uuid = { version = "1.29.0", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
