@@ -20,6 +20,9 @@ pub struct Config {
     /// Eşleşilmiş cihazlar
     #[serde(default)]
     pub trusted: Vec<TrustedPeer>,
+    /// Gönderme hızı sınırı
+    #[serde(default)]
+    pub speed_limit: crate::net::SpeedLimit,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -204,6 +207,7 @@ impl Config {
             download_dir,
             manual_ips: Vec::new(),
             trusted: Vec::new(),
+            speed_limit: Default::default(),
         }
     }
 

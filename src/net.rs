@@ -120,6 +120,87 @@ pub enum NetEvent {
     },
 }
 
+/// Gönderme hızı sınırı.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct SpeedLimit {
+    pub enabled: bool,
+    /// MB/sn
+    pub mb_per_sec: u32,
+    /// Yalnızca belirli saatlerde uygula
+    pub only_hours: bool,
+    /// Başlangıç saati (dahil), 0-23
+    pub from_hour: u32,
+    /// Bitiş saati (hariç), 0-23; başlangıçtan küçükse gece yarısını aşar (ör. 22-06)
+    pub to_hour: u32,
+}
+
+impl Default for SpeedLimit {
+    fn default() -> Self {
+        SpeedLimit {
+            enabled: false,
+            mb_per_sec: 50,
+            only_hours: false,
+            from_hour: 9,
+            to_hour: 18,
+        }
+    }
+}
+
+impl SpeedLimit {
+    /// Verilen saatte geçerli sınır (bayt/sn); sınır yoksa `None`.
+    pub fn bytes_per_sec_at(&self, hour: u32) -> Option<u64> {
+        if !self.enabled || self.mb_per_sec == 0 {
+            return None;
+        }
+        if self.only_hours {
+            let inside = if self.from_hour <= self.to_hour {
+                hour >= self.from_hour && hour < self.to_hour
+            } else {
+                hour >= self.from_hour || hour < self.to_hour
+            };
+            if !inside {
+                return None;
+            }
+        }
+        Some(u64::from(self.mb_per_sec) * 1024 * 1024)
+    }
+}
+
+/// Yazılan veriyi, o anki hız sınırına göre bekleterek iletir.
+/// Sınır her yazmada yeniden okunur; ayar değişince süren aktarıma da uygulanır.
+struct Throttled<'a, W: Write> {
+    inner: W,
+    net: &'a Net,
+    window_start: Instant,
+    window_bytes: u64,
+}
+
+impl<W: Write> Write for Throttled<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(bps) = self.net.current_limit() else {
+            self.window_bytes = 0;
+            return self.inner.write(buf);
+        };
+        // Küçük parçalarla yaz ki bekleme düzgün dağılsın
+        let n = self.inner.write(&buf[..buf.len().min(64 * 1024)])?;
+        if self.window_start.elapsed() > Duration::from_secs(2) {
+            self.window_start = Instant::now();
+            self.window_bytes = 0;
+        }
+        self.window_bytes += n as u64;
+        let due = Duration::from_secs_f64(self.window_bytes as f64 / bps as f64);
+        let elapsed = self.window_start.elapsed();
+        if due > elapsed {
+            thread::sleep(due - elapsed);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub struct NetOptions {
     pub my_id: String,
     pub name: String,
@@ -135,6 +216,7 @@ pub struct NetOptions {
     pub identity: Identity,
     /// Eşleşilmiş cihazlar: hesap kimliği -> açık anahtar
     pub trusted: HashMap<String, PublicKey>,
+    pub speed_limit: SpeedLimit,
 }
 
 /// Aynı bilgisayardaki bir hesabın `local_registry` kaydı.
@@ -177,6 +259,7 @@ struct Inner {
     registry_stopped: Mutex<bool>,
     identity: Identity,
     trusted: RwLock<HashMap<String, PublicKey>>,
+    speed_limit: RwLock<SpeedLimit>,
 }
 
 /// Gönderilecek bir öğe.
@@ -254,6 +337,7 @@ impl Net {
                 registry_stopped: Mutex::new(false),
                 identity: opts.identity,
                 trusted: RwLock::new(opts.trusted),
+                speed_limit: RwLock::new(opts.speed_limit),
             }),
         };
 
@@ -308,6 +392,21 @@ impl Net {
     /// ulaşmadığı ağlarda elle eklenen bilgisayarlar için.
     pub fn add_target(&self, ip: IpAddr) {
         self.inner.unicast_targets.lock().unwrap().insert(ip);
+    }
+
+    pub fn set_speed_limit(&self, limit: SpeedLimit) {
+        *self.inner.speed_limit.write().unwrap() = limit;
+    }
+
+    /// Şu anki gönderme sınırı (bayt/sn).
+    fn current_limit(&self) -> Option<u64> {
+        use chrono::Timelike;
+        let hour = chrono::Local::now().hour();
+        self.inner
+            .speed_limit
+            .read()
+            .unwrap()
+            .bytes_per_sec_at(hour)
     }
 
     /// Eşleşilmiş cihaz listesini günceller.
@@ -1052,7 +1151,13 @@ impl Net {
                     done += offset;
                     progress.report(done, true);
                     let base = done;
-                    protocol::copy_exact(&mut reader, &mut s, size_now - offset, cancel, |n| {
+                    let mut out = Throttled {
+                        inner: &mut s,
+                        net: self,
+                        window_start: Instant::now(),
+                        window_bytes: 0,
+                    };
+                    protocol::copy_exact(&mut reader, &mut out, size_now - offset, cancel, |n| {
                         progress.report(base + n, false)
                     })?;
                     done += size_now - offset;
@@ -1374,6 +1479,7 @@ mod tests {
                 local_registry: None,
                 identity: Identity::generate(),
                 trusted: HashMap::new(),
+                speed_limit: SpeedLimit::default(),
             },
             || {},
         )
@@ -1458,6 +1564,7 @@ mod tests {
                     local_registry: Some(registry.clone()),
                     identity: Identity::generate(),
                     trusted: HashMap::new(),
+                    speed_limit: SpeedLimit::default(),
                 },
                 || {},
             )
@@ -1738,6 +1845,66 @@ mod tests {
                 .all(|e| !matches!(e, NetEvent::Deleted { .. }))
         );
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn speed_limit_hours_and_wraparound() {
+        let mut l = SpeedLimit {
+            enabled: true,
+            mb_per_sec: 10,
+            ..SpeedLimit::default()
+        };
+        assert_eq!(l.bytes_per_sec_at(3), Some(10 * 1024 * 1024));
+        l.only_hours = true; // 09-18
+        assert_eq!(l.bytes_per_sec_at(8), None);
+        assert!(l.bytes_per_sec_at(9).is_some());
+        assert!(l.bytes_per_sec_at(17).is_some());
+        assert_eq!(l.bytes_per_sec_at(18), None);
+        l.from_hour = 22; // gece: 22-06
+        l.to_hour = 6;
+        assert!(l.bytes_per_sec_at(23).is_some());
+        assert!(l.bytes_per_sec_at(2).is_some());
+        assert_eq!(l.bytes_per_sec_at(12), None);
+        l.enabled = false;
+        assert_eq!(l.bytes_per_sec_at(23), None);
+    }
+
+    #[test]
+    fn speed_limit_slows_down_sending() {
+        let da = temp_dir("sa");
+        let db = temp_dir("sb");
+        let (a, rx_a) = start("A", &da);
+        let (b, rx_b) = start("B", &db);
+        pair_up(&a, "A", &b, "B");
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+        let f = da.join("4mb.bin");
+        fs::write(&f, pattern(4 << 20, 9)).unwrap();
+
+        a.set_speed_limit(SpeedLimit {
+            enabled: true,
+            mb_per_sec: 2,
+            ..SpeedLimit::default()
+        });
+        let t = Instant::now();
+        a.send_path(addr_b, "B".into(), "yavas".into(), f.clone());
+        completed(&rx_b, "yavas");
+        completed(&rx_a, "yavas");
+        let slow = t.elapsed();
+        // 4 MB, 2 MB/sn: yaklaşık 2 saniye
+        assert!(
+            slow >= Duration::from_millis(1700),
+            "sınır uygulanmadı: {slow:?}"
+        );
+        assert!(slow < Duration::from_secs(6), "çok yavaş: {slow:?}");
+
+        // Sınır kalkınca hızlı
+        a.set_speed_limit(SpeedLimit::default());
+        let t = Instant::now();
+        a.send_path(addr_b, "B".into(), "hizli".into(), f);
+        completed(&rx_b, "hizli");
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        fs::remove_dir_all(da).unwrap();
+        fs::remove_dir_all(db).unwrap();
     }
 
     #[test]

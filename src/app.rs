@@ -95,6 +95,7 @@ fn is_image(name: &str) -> bool {
 const THUMB_MAX_FILE: u64 = 64 * 1024 * 1024;
 
 struct Settings {
+    speed: net::SpeedLimit,
     has_password: bool,
     pw_current: String,
     pw_new: String,
@@ -178,6 +179,7 @@ impl LanChatApp {
                 local_registry,
                 identity: profile.identity.clone(),
                 trusted: cfg.trusted_map(),
+                speed_limit: cfg.speed_limit,
             },
             move || ctx.request_repaint(),
         );
@@ -927,6 +929,7 @@ impl LanChatApp {
                 ui.menu_button("👤 Hesaplar", |ui| self.accounts_menu(ui));
                 if ui.button("⚙ Ayarlar").clicked() {
                     self.settings = Some(Settings {
+                        speed: self.cfg.speed_limit,
                         has_password: self.profile.has_password(),
                         pw_current: String::new(),
                         pw_new: String::new(),
@@ -1688,6 +1691,41 @@ impl LanChatApp {
                 });
                 ui.add_space(10.0);
 
+                ui.label(RichText::new("Aktarım hızı").strong());
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut s.speed.enabled, "Gönderirken hızı sınırla:");
+                    ui.add_enabled(
+                        s.speed.enabled,
+                        egui::DragValue::new(&mut s.speed.mb_per_sec)
+                            .range(1..=2000)
+                            .suffix(" MB/sn"),
+                    );
+                });
+                ui.add_enabled_ui(s.speed.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.speed.only_hours, "Yalnızca şu saatler arasında:");
+                        ui.add_enabled(
+                            s.speed.only_hours,
+                            egui::DragValue::new(&mut s.speed.from_hour)
+                                .range(0..=23)
+                                .suffix(":00"),
+                        );
+                        ui.label("–");
+                        ui.add_enabled(
+                            s.speed.only_hours,
+                            egui::DragValue::new(&mut s.speed.to_hour)
+                                .range(0..=23)
+                                .suffix(":00"),
+                        );
+                    });
+                });
+                ui.label(
+                    RichText::new("Bu bilgisayarın gönderdiği dosyalar için geçerlidir; büyük aktarımlar mesai saatlerinde ağı tıkamasın diye. Süren aktarımlara da hemen uygulanır.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+
                 ui.label(RichText::new("Hesap şifresi").strong());
                 let pw_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
                     ui.add(TextEdit::singleline(text).password(true).hint_text(hint).desired_width(260.0));
@@ -1834,7 +1872,9 @@ impl LanChatApp {
             self.cfg.download_dir = s.download_dir;
             self.cfg.manual_ips = s.manual_ips;
             self.cfg.trusted = s.trusted;
+            self.cfg.speed_limit = s.speed;
             if let Some(net) = &self.net {
+                net.set_speed_limit(self.cfg.speed_limit);
                 net.set_trusted(self.cfg.trusted_map());
                 net.set_name(&self.cfg.name);
                 net.set_download_dir(self.cfg.download_dir.clone());
