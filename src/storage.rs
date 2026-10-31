@@ -176,6 +176,16 @@ pub struct ChatMessage {
     /// Tepkiler: kişi kimliği (bizim için kendi hesap kimliğimiz) → emoji
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reactions: BTreeMap<String, String>,
+    /// Bir grup mesajının bir üyeye giden kopyasıysa grubun kimliği
+    /// (bu kopyalar kişiyle olan sohbette görünmez)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Grup mesajının tüm üyelerdeki ortak kimliği
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gmid: Option<String>,
+    /// Gruptan gelen mesajı yazan kişi
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     /// Aktarılan bayt (yalnızca aktarım sürerken anlamlı)
     #[serde(skip)]
     pub progress: u64,
@@ -200,6 +210,9 @@ impl ChatMessage {
             children: Vec::new(),
             edited: false,
             reactions: BTreeMap::new(),
+            group: None,
+            gmid: None,
+            author: None,
             progress: 0,
             speed: Speed::default(),
         }
@@ -255,6 +268,40 @@ pub struct History {
     /// Çevrimdışı kişilere iletilmeyi bekleyen bildirimler (düzeltme, tepki, silme)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbox: Vec<Outgoing>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Group>,
+}
+
+/// Grup sohbeti
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Group {
+    /// "grup-" ile başlar
+    pub id: String,
+    pub name: String,
+    /// Tüm üyeler (biz dahil)
+    pub members: Vec<crate::protocol::Member>,
+    /// Bilginin sürümü (ms); daha yenisi gelirse güncellenir
+    pub rev: i64,
+    /// Gruptan çıktık: gelen mesajlar yok sayılır
+    #[serde(default)]
+    pub left: bool,
+}
+
+impl Group {
+    /// Grup bilgisi, mesajla birlikte gönderilmek üzere
+    pub fn to_ref(&self, gmid: &str) -> crate::protocol::GroupRef {
+        crate::protocol::GroupRef {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            members: self.members.clone(),
+            rev: self.rev,
+            gmid: gmid.to_string(),
+        }
+    }
+
+    pub fn is_group_id(id: &str) -> bool {
+        id.starts_with("grup-")
+    }
 }
 
 /// Bir kişiye gönderilecek kısa bildirim
@@ -875,6 +922,7 @@ mod tests {
                 MsgState::Done,
             )],
             outbox: vec![],
+            groups: vec![],
         }
     }
 
@@ -1025,6 +1073,7 @@ mod tests {
                 peer_id: "p".into(),
                 signal: Signal::Delete { msg_id: "9".into() },
             }],
+            groups: vec![],
         };
         h.save(&dir).unwrap();
         let loaded = History::load(&dir);

@@ -4,11 +4,11 @@ use crate::backup;
 use crate::clip::{self, ClipContent};
 use crate::desktop::{self, DesktopEvent};
 use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
-use crate::protocol::{self, ReplyRef};
+use crate::protocol::{self, GroupRef, Member, ReplyRef};
 use crate::secure::PublicKey;
 use crate::storage::{
-    self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Outgoing, Profile, Signal,
-    ThemeChoice, TrustedPeer,
+    self, Body, ChatMessage, Config, Group, History, KnownPeer, MsgState, Outgoing, Profile,
+    Signal, ThemeChoice, TrustedPeer,
 };
 use crate::update;
 use chrono::{Local, TimeZone};
@@ -67,6 +67,16 @@ impl Peer {
     fn online(&self) -> bool {
         self.last_seen.is_some_and(|t| t.elapsed() < ONLINE_TIMEOUT)
     }
+}
+
+/// Grup oluşturma / düzenleme penceresi
+struct GroupEdit {
+    /// Düzenlenen grup (yeni grupta yok)
+    id: Option<String>,
+    name: String,
+    members: std::collections::BTreeSet<String>,
+    error: Option<String>,
+    confirm_leave: bool,
 }
 
 struct NewAccount {
@@ -164,6 +174,9 @@ pub struct LanChatApp {
     paste_preview: Option<(String, egui::ColorImage, egui::TextureHandle)>,
     /// Dosya Gezgini'nden "Gönder → LanChat" ile gelen, kime gideceği sorulan dosyalar
     send_choice: Option<Vec<PathBuf>>,
+    groups: Vec<Group>,
+    /// Açık grup oluşturma/düzenleme penceresi
+    group_edit: Option<GroupEdit>,
     /// Pencereden dışarı sürüklenecek dosya (bu karenin sonunda başlatılır)
     drag_out: Option<PathBuf>,
     /// Dışarı sürükleme bitti: egui fare bırakılmasını görmediği için bildirilecek
@@ -303,6 +316,8 @@ impl LanChatApp {
             last_queue_check: Instant::now(),
             paste_preview: None,
             send_choice: None,
+            groups: history.groups,
+            group_edit: None,
             drag_out: None,
             release_pointer: false,
             search: None,
@@ -415,10 +430,13 @@ impl LanChatApp {
                 ));
             }
             if self.cfg.notifications {
-                let name = self
-                    .peer(peer_id)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| "LanChat".into());
+                let name = match self.group(peer_id) {
+                    Some(g) => format!("👥 {}", g.name),
+                    None => self
+                        .peer(peer_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "LanChat".into()),
+                };
                 self.notify(ctx, &name, preview, Some(peer_id.to_string()));
             }
         }
@@ -603,7 +621,7 @@ impl LanChatApp {
                 if let Some(m) = self
                     .messages
                     .iter_mut()
-                    .find(|m| m.id == msg_id && m.peer_id == peer_id && !m.outgoing)
+                    .find(|m| m.id == msg_id && from_sender(m, &peer_id) && !m.outgoing)
                 {
                     clear_message(m);
                     self.dirty = true;
@@ -615,11 +633,9 @@ impl LanChatApp {
                 text,
             } => {
                 // Yalnızca o kişinin bize gönderdiği metin mesajı düzeltilebilir
-                if let Some(m) = self
-                    .messages
-                    .iter_mut()
-                    .find(|m| m.id == msg_id && m.peer_id == peer_id && !m.outgoing && !m.deleted)
-                    && matches!(m.body, Body::Text(_))
+                if let Some(m) = self.messages.iter_mut().find(|m| {
+                    m.id == msg_id && from_sender(m, &peer_id) && !m.outgoing && !m.deleted
+                }) && matches!(m.body, Body::Text(_))
                 {
                     m.body = Body::Text(text);
                     m.edited = true;
@@ -631,13 +647,15 @@ impl LanChatApp {
                 msg_id,
                 emoji,
             } => {
-                if let Some(m) = self
-                    .messages
-                    .iter_mut()
-                    .find(|m| m.id == msg_id && m.peer_id == peer_id && !m.deleted)
-                {
-                    match emoji {
-                        Some(e) => m.reactions.insert(peer_id, e),
+                // Kişiyle olan sohbetteki mesaj ya da (ortak kimlikle) grup mesajı
+                for m in self.messages.iter_mut().filter(|m| {
+                    !m.deleted
+                        && ((m.id == msg_id && m.peer_id == peer_id)
+                            || (m.gmid.as_deref() == Some(&msg_id)
+                                && Group::is_group_id(&m.peer_id)))
+                }) {
+                    match &emoji {
+                        Some(e) => m.reactions.insert(peer_id.clone(), e.clone()),
                         None => m.reactions.remove(&peer_id),
                     };
                     self.dirty = true;
@@ -690,29 +708,42 @@ impl LanChatApp {
                 msg_id,
                 text,
                 reply_to,
+                group,
             } => {
                 self.upsert_peer(&from.id, &from.name, addr, None);
                 self.typing.remove(&from.id);
                 // Aynı mesaj ikinci kez gelirse (ör. onay ulaşmadan bağlantı koptuysa) yok say
-                if self
-                    .messages
-                    .iter()
-                    .any(|m| m.id == msg_id && m.peer_id == from.id)
-                {
+                if self.messages.iter().any(|m| {
+                    m.id == msg_id
+                        && (m.peer_id == from.id || m.author.as_deref() == Some(&from.id))
+                }) {
                     return;
                 }
-                let preview = text.clone();
+                let (chat, gmid) = match &group {
+                    Some(g) => match self.accept_group(g) {
+                        Some(gid) => (gid, Some(g.gmid.clone())),
+                        None => return,
+                    },
+                    None => (from.id.clone(), None),
+                };
+                let preview = if group.is_some() {
+                    format!("{}: {text}", from.name)
+                } else {
+                    text.clone()
+                };
                 self.push_message(ChatMessage {
                     reply_to,
+                    gmid,
+                    author: group.is_some().then(|| from.id.clone()),
                     ..ChatMessage::new(
                         msg_id,
-                        from.id.clone(),
+                        chat.clone(),
                         false,
                         Body::Text(text),
                         MsgState::Done,
                     )
                 });
-                self.on_incoming(ctx, &from.id, &preview);
+                self.on_incoming(ctx, &chat, &preview);
             }
             NetEvent::IncomingTransfer {
                 from,
@@ -722,8 +753,17 @@ impl LanChatApp {
                 is_dir,
                 total_size,
                 file_count,
+                group,
             } => {
                 self.upsert_peer(&from.id, &from.name, addr, None);
+                let (chat, gmid) = match &group {
+                    Some(g) => match self.accept_group(g) {
+                        Some(gid) => (gid, Some(g.gmid.clone())),
+                        // Çıkılan grup: dosya yine kaydedilir ama sohbette gösterilmez
+                        None => return,
+                    },
+                    None => (from.id.clone(), None),
+                };
                 if let Some(m) = self.message_mut(&msg_id) {
                     // Yarım kalan aktarım kaldığı yerden devam ediyor
                     m.state = MsgState::Pending;
@@ -740,7 +780,7 @@ impl LanChatApp {
                     }
                     self.dirty = true;
                 } else {
-                    let preview = if is_dir {
+                    let mut preview = if is_dir {
                         format!(
                             "📁 {name} klasörünü gönderiyor ({})",
                             format_bytes(total_size)
@@ -751,20 +791,27 @@ impl LanChatApp {
                             format_bytes(total_size)
                         )
                     };
-                    self.push_message(ChatMessage::new(
-                        msg_id,
-                        from.id.clone(),
-                        false,
-                        Body::File {
-                            name,
-                            size: total_size,
-                            path: None,
-                            is_dir,
-                            file_count,
-                        },
-                        MsgState::Pending,
-                    ));
-                    self.on_incoming(ctx, &from.id, &preview);
+                    if group.is_some() {
+                        preview = format!("{}: {preview}", from.name);
+                    }
+                    self.push_message(ChatMessage {
+                        gmid,
+                        author: group.is_some().then(|| from.id.clone()),
+                        ..ChatMessage::new(
+                            msg_id,
+                            chat.clone(),
+                            false,
+                            Body::File {
+                                name,
+                                size: total_size,
+                                path: None,
+                                is_dir,
+                                file_count,
+                            },
+                            MsgState::Pending,
+                        )
+                    });
+                    self.on_incoming(ctx, &chat, &preview);
                 }
             }
             NetEvent::Scanned {
@@ -838,6 +885,7 @@ impl LanChatApp {
                 .collect(),
             messages: self.messages.clone(),
             outbox: self.outbox.clone(),
+            groups: self.groups.clone(),
         }
     }
 
@@ -910,6 +958,8 @@ impl LanChatApp {
             id: m.id.clone(),
             author: if m.outgoing {
                 self.cfg.name.clone()
+            } else if let Some(a) = &m.author {
+                self.display_name(a)
             } else {
                 peer_name.to_string()
             },
@@ -952,7 +1002,7 @@ impl LanChatApp {
         let Some(m) = self.messages.iter().find(|m| m.id == msg_id) else {
             return Vec::new();
         };
-        if m.peer_id == BROADCAST {
+        if !m.children.is_empty() || m.peer_id == BROADCAST {
             m.children
                 .iter()
                 .filter_map(|id| self.messages.iter().find(|x| &x.id == id))
@@ -1060,9 +1110,15 @@ impl LanChatApp {
             mm.note = None;
             mm.speed.reset();
         }
+        let group: Option<GroupRef> = m.group.as_ref().and_then(|gid| {
+            let g = self.groups.iter().find(|g| &g.id == gid)?;
+            Some(g.to_ref(m.gmid.as_deref().unwrap_or(&m.id)))
+        });
         match m.body {
-            Body::Text(t) => net.send_reply(addr, m.peer_id, m.id, t, m.reply_to),
-            Body::File { path: Some(p), .. } => net.send_path(addr, m.peer_id, m.id, p),
+            Body::Text(t) => net.send_reply(addr, m.peer_id, m.id, t, m.reply_to, group),
+            Body::File { path: Some(p), .. } => {
+                net.send_path_to_group(addr, m.peer_id, m.id, p, group)
+            }
             Body::File { path: None, .. } | Body::Nudge => {}
         }
     }
@@ -1075,6 +1131,27 @@ impl LanChatApp {
         };
         let new =
             (m.reactions.get(&me).map(String::as_str) != Some(emoji)).then(|| emoji.to_string());
+        // Grup mesajı: tepki ortak kimlikle tüm üyelere gider
+        if Group::is_group_id(&m.peer_id)
+            && let Some(gmid) = m.gmid.clone()
+        {
+            let gid = m.peer_id.clone();
+            if let Some(m) = self.message_mut(msg_id) {
+                match &new {
+                    Some(e) => m.reactions.insert(me.clone(), e.clone()),
+                    None => m.reactions.remove(&me),
+                };
+            }
+            self.dirty = true;
+            for member in self.group_targets(&gid) {
+                let signal = Signal::React {
+                    msg_id: gmid.clone(),
+                    emoji: new.clone(),
+                };
+                self.send_signal(&member, signal);
+            }
+            return;
+        }
         let copies = self.copies_of(msg_id);
         let mut ids: Vec<&str> = copies.iter().map(|(_, id)| id.as_str()).collect();
         ids.push(msg_id);
@@ -1478,7 +1555,7 @@ impl LanChatApp {
         let Some(peer_id) = self.selected.clone() else {
             return;
         };
-        if !self.is_paired(&peer_id) {
+        if Group::is_group_id(&peer_id) || !self.is_paired(&peer_id) {
             return;
         }
         if let (Some(net), Some(addr)) = (&self.net, self.peer(&peer_id).and_then(|p| p.addr)) {
@@ -1495,13 +1572,17 @@ impl LanChatApp {
         let Some(peer_id) = self.selected.clone() else {
             return;
         };
-        let ids: Vec<String> = self
+        // Gruplarda okundu bilgisi mesajı yazana gider
+        let mut by_sender: HashMap<String, Vec<String>> = HashMap::new();
+        for m in self
             .messages
             .iter()
             .filter(|m| !m.outgoing && !m.read_sent && m.peer_id == peer_id)
-            .map(|m| m.id.clone())
-            .collect();
-        if ids.is_empty() {
+        {
+            let to = m.author.clone().unwrap_or_else(|| peer_id.clone());
+            by_sender.entry(to).or_default().push(m.id.clone());
+        }
+        if by_sender.is_empty() {
             return;
         }
         for m in self.messages.iter_mut() {
@@ -1510,11 +1591,13 @@ impl LanChatApp {
             }
         }
         self.dirty = true;
-        if !self.is_paired(&peer_id) {
-            return;
-        }
-        if let (Some(net), Some(addr)) = (&self.net, self.peer(&peer_id).and_then(|p| p.addr)) {
-            net.send_read(addr, peer_id, ids);
+        for (to, ids) in by_sender {
+            if !self.is_paired(&to) {
+                continue;
+            }
+            if let (Some(net), Some(addr)) = (&self.net, self.peer(&to).and_then(|p| p.addr)) {
+                net.send_read(addr, to, ids);
+            }
         }
     }
 
@@ -1547,6 +1630,316 @@ impl LanChatApp {
             .collect()
     }
 
+    /* ------------------------------ Gruplar ------------------------------ */
+
+    fn group(&self, id: &str) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// Grup mesajının gideceği üyeler: biz hariç, eşleştiğimiz üyeler.
+    fn group_targets(&self, gid: &str) -> Vec<String> {
+        self.group(gid)
+            .map(|g| {
+                g.members
+                    .iter()
+                    .filter(|m| m.id != self.cfg.id && self.is_paired(&m.id))
+                    .map(|m| m.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Gruptaki, eşleşmediğimiz (mesajlarımızın gitmeyeceği) üyelerin adları.
+    fn group_unpaired(&self, gid: &str) -> Vec<String> {
+        self.group(gid)
+            .map(|g| {
+                g.members
+                    .iter()
+                    .filter(|m| m.id != self.cfg.id && !self.is_paired(&m.id))
+                    .map(|m| m.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Kişinin görünen adı (gruptaki bilgiden de bakılır).
+    fn display_name(&self, id: &str) -> String {
+        if let Some(p) = self.peer(id) {
+            return p.name.clone();
+        }
+        self.groups
+            .iter()
+            .flat_map(|g| g.members.iter())
+            .find(|m| m.id == id)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "?".into())
+    }
+
+    /// Gelen grup bilgisini kaydeder (yeni grup ya da daha yeni bilgi).
+    /// Çıktığımız grupsa `None`.
+    fn accept_group(&mut self, g: &GroupRef) -> Option<String> {
+        if !Group::is_group_id(&g.id) {
+            return None;
+        }
+        match self.groups.iter_mut().find(|x| x.id == g.id) {
+            Some(x) => {
+                if x.left {
+                    return None;
+                }
+                if g.rev > x.rev {
+                    x.name = g.name.chars().take(60).collect();
+                    x.members = g.members.clone();
+                    x.rev = g.rev;
+                    self.dirty = true;
+                }
+            }
+            None => {
+                self.groups.push(Group {
+                    id: g.id.clone(),
+                    name: g.name.chars().take(60).collect(),
+                    members: g.members.clone(),
+                    rev: g.rev,
+                    left: false,
+                });
+                self.dirty = true;
+            }
+        }
+        Some(g.id.clone())
+    }
+
+    /// Gruba mesaj ya da dosya gönderir: her üyeye bir kopya (çevrimdışı olanlara
+    /// sıraya girer) ve grup sohbetinde görünen bir özet.
+    fn send_to_group(&mut self, gid: &str, body: Body, reply_to: Option<ReplyRef>) -> bool {
+        let targets = self.group_targets(gid);
+        if targets.is_empty() {
+            self.show_toast("Bu grupta mesaj gönderebileceğiniz (eşleştiğiniz) kimse yok");
+            return false;
+        }
+        let gmid = new_id();
+        let mut children = Vec::new();
+        for member in targets {
+            let id = new_id();
+            self.push_message(ChatMessage {
+                group: Some(gid.to_string()),
+                gmid: Some(gmid.clone()),
+                reply_to: reply_to.clone(),
+                ..ChatMessage::new(id.clone(), member, true, body.clone(), MsgState::Queued)
+            });
+            self.dispatch(&id);
+            children.push(id);
+        }
+        self.push_message(ChatMessage {
+            children,
+            gmid: Some(gmid.clone()),
+            reply_to,
+            ..ChatMessage::new(gmid, gid.to_string(), true, body, MsgState::Done)
+        });
+        true
+    }
+
+    fn open_group_editor(&mut self, gid: Option<&str>) {
+        let edit = match gid.and_then(|id| self.group(id)) {
+            Some(g) => GroupEdit {
+                id: Some(g.id.clone()),
+                name: g.name.clone(),
+                members: g
+                    .members
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .filter(|id| *id != self.cfg.id)
+                    .collect(),
+                error: None,
+                confirm_leave: false,
+            },
+            None => GroupEdit {
+                id: None,
+                name: String::new(),
+                members: Default::default(),
+                error: None,
+                confirm_leave: false,
+            },
+        };
+        self.group_edit = Some(edit);
+    }
+
+    fn group_window(&mut self, ctx: &egui::Context) {
+        let Some(ge) = &mut self.group_edit else {
+            return;
+        };
+        // Seçilebilecek kişiler: eşleştiklerimiz (+ grupta zaten olanlar)
+        let mut people: Vec<(String, String, bool)> = self
+            .peers
+            .iter()
+            .filter(|p| p.local || self.cfg.is_trusted(&p.id))
+            .map(|p| (p.id.clone(), p.name.clone(), true))
+            .collect();
+        if let Some(g) = ge
+            .id
+            .as_ref()
+            .and_then(|id| self.groups.iter().find(|g| &g.id == id))
+        {
+            for m in &g.members {
+                if m.id != self.cfg.id && !people.iter().any(|p| p.0 == m.id) {
+                    people.push((m.id.clone(), m.name.clone(), false));
+                }
+            }
+        }
+        people.sort_by_key(|p| p.1.to_lowercase());
+        let mut save = false;
+        let mut close = false;
+        let mut leave = false;
+        let title = if ge.id.is_some() { "Grup" } else { "Yeni grup" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Grubun adı").strong());
+                ui.add(
+                    TextEdit::singleline(&mut ge.name)
+                        .hint_text("ör. Ev ve Ofis")
+                        .char_limit(60)
+                        .desired_width(300.0),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Üyeler").strong());
+                if people.is_empty() {
+                    ui.label(RichText::new("Henüz eşleştiğiniz kimse yok.").weak());
+                }
+                ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (id, name, paired) in &people {
+                        let mut on = ge.members.contains(id);
+                        let label = if *paired {
+                            name.clone()
+                        } else {
+                            format!("{name}  (eşleşmediniz)")
+                        };
+                        if ui.checkbox(&mut on, label).changed() {
+                            if on {
+                                ge.members.insert(id.clone());
+                            } else {
+                                ge.members.remove(id);
+                            }
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Grup, üyelere ilk mesajla birlikte ulaşır. Herkes yalnızca eşleştiği \
+                         üyelere mesaj gönderebilir.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if let Some(e) = &ge.error {
+                    ui.colored_label(Color32::from_rgb(220, 38, 38), e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = if ge.id.is_some() {
+                        "Kaydet"
+                    } else {
+                        "Oluştur"
+                    };
+                    if ui.button(RichText::new(label).strong()).clicked() {
+                        save = true;
+                    }
+                    if ui.button("Vazgeç").clicked() {
+                        close = true;
+                    }
+                    if ge.id.is_some() {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ge.confirm_leave {
+                                if ui
+                                    .button(
+                                        RichText::new("Evet, çık")
+                                            .color(Color32::from_rgb(220, 38, 38)),
+                                    )
+                                    .clicked()
+                                {
+                                    leave = true;
+                                }
+                                ui.label(RichText::new("Emin misiniz?").small());
+                            } else if ui.button("🚪 Gruptan çık").clicked() {
+                                ge.confirm_leave = true;
+                            }
+                        });
+                    }
+                });
+            });
+        if close {
+            self.group_edit = None;
+            return;
+        }
+        if leave {
+            if let Some(id) = ge.id.clone()
+                && let Some(g) = self.groups.iter_mut().find(|g| g.id == id)
+            {
+                g.left = true;
+                self.messages
+                    .retain(|m| m.peer_id != id && m.group.as_deref() != Some(&id));
+                if self.selected.as_deref() == Some(&id) {
+                    self.selected = None;
+                }
+                self.dirty = true;
+            }
+            self.group_edit = None;
+            self.show_toast("Gruptan çıktınız");
+            return;
+        }
+        if !save {
+            return;
+        }
+        let name: String = ge.name.trim().chars().take(60).collect();
+        if name.is_empty() {
+            ge.error = Some("Gruba bir ad verin".into());
+            return;
+        }
+        if ge.members.is_empty() {
+            ge.error = Some("En az bir üye seçin".into());
+            return;
+        }
+        let mut members: Vec<Member> = vec![Member {
+            id: self.cfg.id.clone(),
+            name: self.cfg.name.clone(),
+        }];
+        for id in &ge.members {
+            members.push(Member {
+                id: id.clone(),
+                name: people
+                    .iter()
+                    .find(|p| &p.0 == id)
+                    .map(|p| p.1.clone())
+                    .unwrap_or_else(|| "?".into()),
+            });
+        }
+        let rev = chrono::Utc::now().timestamp_millis();
+        let id = match ge.id.clone() {
+            Some(id) => {
+                if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
+                    g.name = name;
+                    g.members = members;
+                    g.rev = rev;
+                }
+                id
+            }
+            None => {
+                let id = format!("grup-{}", new_id());
+                self.groups.push(Group {
+                    id: id.clone(),
+                    name,
+                    members,
+                    rev,
+                    left: false,
+                });
+                id
+            }
+        };
+        self.group_edit = None;
+        self.dirty = true;
+        self.selected = Some(id);
+    }
+
     /// "Herkese" özetinde kişilerin kendi kopyalarına verdiği tepkiler.
     fn summary_reactions(&self, m: &ChatMessage) -> BTreeMap<String, String> {
         let mut all = m.reactions.clone();
@@ -1577,6 +1970,17 @@ impl LanChatApp {
             .count();
         let queued = kids.iter().filter(|k| k.state == MsgState::Queued).count();
         let read = kids.iter().filter(|k| k.read).count();
+        if total == 1 {
+            return match kids.first().map(|k| &k.state) {
+                Some(MsgState::Done) if read == 1 => "✔✔ okundu".into(),
+                Some(MsgState::Done) => "✔ teslim edildi".into(),
+                Some(MsgState::Queued) => "🕓 sırada: çevrimiçi olunca gidecek".into(),
+                Some(MsgState::Failed(_)) => {
+                    "⚠ gönderilemedi (kişinin sohbetinden tekrar deneyin)".into()
+                }
+                _ => "gönderiliyor…".into(),
+            };
+        }
         if failed > 0 {
             format!(
                 "{done}/{total} teslim edildi · {failed} başarısız (kişinin sohbetinden tekrar deneyin)"
@@ -1602,6 +2006,16 @@ impl LanChatApp {
         {
             self.apply_edit(&id, text);
             self.input.clear();
+            return;
+        }
+        if let Some(gid) = self.selected.clone().filter(|s| Group::is_group_id(s)) {
+            let reply_to = match self.replying.take() {
+                Some((p, r)) if p == gid => Some(r),
+                _ => None,
+            };
+            if self.send_to_group(&gid, Body::Text(text), reply_to) {
+                self.input.clear();
+            }
             return;
         }
         if self.selected.as_deref() == Some(BROADCAST) {
@@ -1660,6 +2074,28 @@ impl LanChatApp {
 
     /// Dosyaları ve/veya klasörleri gönderir.
     fn send_paths(&mut self, paths: Vec<PathBuf>) {
+        if let Some(gid) = self.selected.clone().filter(|s| Group::is_group_id(s)) {
+            for path in paths {
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    self.show_toast(format!("Okunamadı: {}", path.display()));
+                    continue;
+                };
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let is_dir = meta.is_dir();
+                let body = Body::File {
+                    name,
+                    size: if is_dir { 0 } else { meta.len() },
+                    path: Some(path.clone()),
+                    is_dir,
+                    file_count: if is_dir { 0 } else { 1 },
+                };
+                self.send_to_group(&gid, body, None);
+            }
+            return;
+        }
         let broadcast = self.selected.as_deref() == Some(BROADCAST);
         let targets: Vec<String> = if broadcast {
             let t: Vec<_> = self
@@ -2257,6 +2693,39 @@ impl LanChatApp {
                     self.selected = Some(BROADCAST.to_string());
                     ui.memory_mut(|m| m.request_focus(Id::unique(INPUT_ID)));
                 }
+                let groups: Vec<(String, String)> = self
+                    .groups
+                    .iter()
+                    .filter(|g| !g.left)
+                    .map(|g| (g.id.clone(), g.name.clone()))
+                    .collect();
+                for (gid, gname) in groups {
+                    let selected = self.selected.as_deref() == Some(gid.as_str());
+                    let unread = self.unread.get(&gid).copied().unwrap_or(0);
+                    let label = if unread > 0 {
+                        format!("👥 {gname}  ({unread})")
+                    } else {
+                        format!("👥 {gname}")
+                    };
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 28.0],
+                            egui::Button::selectable(selected, RichText::new(label).size(15.0)),
+                        )
+                        .clicked()
+                    {
+                        self.unread.remove(&gid);
+                        self.selected = Some(gid);
+                        ui.memory_mut(|m| m.request_focus(Id::unique(INPUT_ID)));
+                    }
+                }
+                if ui
+                    .add_sized([ui.available_width(), 24.0], egui::Button::new(RichText::new("➕ Yeni grup").small()))
+                    .on_hover_text("Seçtiğiniz kişilerle bir grup sohbeti başlatın")
+                    .clicked()
+                {
+                    self.open_group_editor(None);
+                }
                 ui.separator();
             }
             for i in order {
@@ -2448,6 +2917,7 @@ impl LanChatApp {
                 self.send_paths(paths);
             }
             if current.as_deref() != Some(BROADCAST)
+                && !current.as_deref().is_some_and(Group::is_group_id)
                 && ui
                     .button(RichText::new("📳").size(18.0))
                     .on_hover_text("Titreşim gönder: karşı tarafın penceresi öne gelir ve sallanır")
@@ -2490,19 +2960,37 @@ impl LanChatApp {
         };
 
         let is_broadcast = peer_id == BROADCAST;
+        let is_group = Group::is_group_id(&peer_id);
         let targets = if is_broadcast {
             self.broadcast_targets()
         } else {
             Vec::new()
         };
+        let group_info = self.group(&peer_id).map(|g| {
+            let names: Vec<String> = g
+                .members
+                .iter()
+                .map(|m| {
+                    if m.id == self.cfg.id {
+                        "Siz".to_string()
+                    } else {
+                        m.name.clone()
+                    }
+                })
+                .collect();
+            (g.name.clone(), names, self.group_unpaired(&g.id))
+        });
         let (name, online) = if is_broadcast {
             ("📢 Herkese".to_string(), targets.iter().any(|t| t.2))
+        } else if let Some((n, _, _)) = &group_info {
+            (format!("👥 {n}"), true)
         } else {
             self.peer(&peer_id)
                 .map(|p| (p.name.clone(), p.online()))
                 .unwrap_or_else(|| ("?".into(), false))
         };
-        let paired = is_broadcast || self.is_paired(&peer_id);
+        let paired = is_broadcast || is_group || self.is_paired(&peer_id);
+        let mut edit_group = false;
         let local = self.peer(&peer_id).is_some_and(|p| p.local);
 
         // Arama (Ctrl+F ile de açılır)
@@ -2545,6 +3033,25 @@ impl LanChatApp {
                         toggle_search = true;
                     }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                if let Some((_, names, unpaired)) = &group_info {
+                    ui.label(RichText::new(format!("{} üye", names.len())).small().weak())
+                        .on_hover_text(names.join(", "));
+                    if !unpaired.is_empty() {
+                        ui.label(
+                            RichText::new(format!("⚠ {} kişiyle eşleşmediniz", unpaired.len()))
+                                .small()
+                                .color(Color32::from_rgb(234, 88, 12)),
+                        )
+                        .on_hover_text(format!(
+                            "Mesajlarınız şu üyelere gitmez: {}. Onlarla eşleşirseniz gider.",
+                            unpaired.join(", ")
+                        ));
+                    }
+                    if ui.small_button("⚙ Grup").on_hover_text("Adı ve üyeleri değiştir, gruptan çık").clicked() {
+                        edit_group = true;
+                    }
+                    return;
+                }
                 if is_broadcast {
                     let names: Vec<&str> = targets.iter().map(|(_, n, _)| n.as_str()).collect();
                     let on = targets.iter().filter(|t| t.2).count();
@@ -2652,6 +3159,9 @@ impl LanChatApp {
         if wake_clicked {
             self.wake_peer(&peer_id);
         }
+        if edit_group {
+            self.open_group_editor(Some(&peer_id));
+        }
         if export_clicked {
             self.export_chat(&peer_id, &name);
         }
@@ -2728,7 +3238,7 @@ impl LanChatApp {
                     let msgs: Vec<&ChatMessage> = self
                         .messages
                         .iter()
-                        .filter(|m| m.peer_id == peer_id)
+                        .filter(|m| m.peer_id == peer_id && m.group.is_none())
                         .filter(|m| query.as_ref().is_none_or(|q| message_matches(m, q)))
                         .collect();
                     if msgs.is_empty() && query.is_some() {
@@ -2756,7 +3266,9 @@ impl LanChatApp {
                             nudge_line(ui, m, &name);
                             continue;
                         }
-                        let status = is_broadcast.then(|| self.broadcast_status(m));
+                        let status = (is_broadcast || (is_group && m.outgoing))
+                            .then(|| self.broadcast_status(m));
+                        let author = m.author.as_ref().map(|a| self.display_name(a));
                         let thumb = match self.thumbs.get(&m.id) {
                             Some(Thumb::Ready(t)) => Some(t),
                             _ => None,
@@ -2779,6 +3291,7 @@ impl LanChatApp {
                             Cow::Borrowed(&m.reactions)
                         };
                         let ctx = BubbleCtx {
+                            author,
                             status,
                             thumb,
                             reactions: &reactions,
@@ -3221,6 +3734,8 @@ const REACTIONS: [&str; 6] = ["👍", "❤", "😂", "😮", "😢", "🙏"];
 
 /// Balonun çizilmesi için gereken ek bilgiler
 struct BubbleCtx<'a> {
+    /// Grup mesajında yazanın adı
+    author: Option<String>,
     /// "Herkese" sohbetindeki özet mesajlar için toplu teslim durumu
     status: Option<String>,
     thumb: Option<&'a egui::TextureHandle>,
@@ -3228,6 +3743,11 @@ struct BubbleCtx<'a> {
     my_id: &'a str,
     /// Kişi kimliği → görünen ad
     names: &'a HashMap<String, String>,
+}
+
+/// Mesaj bu kişiden mi geldi? (kişiyle olan sohbette ya da grupta onun yazdığı)
+fn from_sender(m: &ChatMessage, peer_id: &str) -> bool {
+    m.peer_id == peer_id || m.author.as_deref() == Some(peer_id)
 }
 
 /// Silinen mesajın içeriğini temizler.
@@ -3240,6 +3760,7 @@ fn clear_message(m: &mut ChatMessage) {
 
 fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &mut Vec<Action>) {
     let BubbleCtx {
+        author,
         status,
         thumb,
         reactions,
@@ -3281,6 +3802,14 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &m
             .show(ui, |ui| {
                 ui.set_max_width(max_w);
                 ui.vertical(|ui| {
+                    if let Some(a) = &author {
+                        ui.label(
+                            RichText::new(a)
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(248, 113, 113)),
+                        );
+                    }
                     if let Some(r) = &m.reply_to {
                         Frame::new()
                             .fill(ui.visuals().faint_bg_color.gamma_multiply(1.6))
@@ -3818,6 +4347,7 @@ impl eframe::App for LanChatApp {
         }
 
         self.settings_window(&ctx);
+        self.group_window(&ctx);
         self.new_account_window(&ctx);
         self.pairing_windows(&ctx);
         self.overlays(&ctx);

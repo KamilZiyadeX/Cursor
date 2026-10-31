@@ -104,6 +104,7 @@ pub enum NetEvent {
         msg_id: String,
         text: String,
         reply_to: Option<protocol::ReplyRef>,
+        group: Option<protocol::GroupRef>,
     },
     /// Karşı taraf bize gönderdiği bir mesajı herkesten sildi
     Deleted {
@@ -135,6 +136,7 @@ pub enum NetEvent {
         is_dir: bool,
         total_size: u64,
         file_count: u64,
+        group: Option<protocol::GroupRef>,
     },
     /// Gönderilecek klasör tarandı; toplam boyut ve dosya sayısı belli oldu.
     Scanned {
@@ -793,6 +795,7 @@ impl Net {
                 msg_id,
                 text,
                 reply_to,
+                group,
             } => {
                 if from.id == self.inner.my_id {
                     return;
@@ -810,6 +813,7 @@ impl Net {
                     msg_id,
                     text,
                     reply_to,
+                    group,
                 });
                 let _ = stream.write_all(&[ACK_OK]);
             }
@@ -820,6 +824,7 @@ impl Net {
                 is_dir,
                 total_size,
                 file_count,
+                group,
             } => {
                 if from.id == self.inner.my_id {
                     return;
@@ -846,6 +851,7 @@ impl Net {
                     is_dir,
                     total_size,
                     file_count,
+                    group,
                 });
                 let cancel = self.register(&msg_id);
                 let res =
@@ -1213,7 +1219,7 @@ impl Net {
 
     #[cfg(test)]
     pub fn send_text(&self, addr: SocketAddr, peer_id: String, msg_id: String, text: String) {
-        self.send_reply(addr, peer_id, msg_id, text, None);
+        self.send_reply(addr, peer_id, msg_id, text, None, None);
     }
 
     /// Metin mesajı gönderir; `reply_to` verilirse bir mesaja yanıt olarak.
@@ -1224,6 +1230,7 @@ impl Net {
         msg_id: String,
         text: String,
         reply_to: Option<protocol::ReplyRef>,
+        group: Option<protocol::GroupRef>,
     ) {
         let net = self.clone();
         thread::spawn(move || {
@@ -1232,6 +1239,7 @@ impl Net {
                 msg_id: msg_id.clone(),
                 text,
                 reply_to,
+                group,
             };
             let res = (|| {
                 let mut s = net.secure_connect(addr, Some(&peer_id))?;
@@ -1256,11 +1264,24 @@ impl Net {
 
     /// Bir dosyayı ya da klasörü (içindekilerle birlikte) gönderir.
     /// Aynı `msg_id` ile yeniden çağrılırsa alıcı kaldığı yerden devam eder.
+    #[cfg(test)]
     pub fn send_path(&self, addr: SocketAddr, peer_id: String, msg_id: String, path: PathBuf) {
+        self.send_path_to_group(addr, peer_id, msg_id, path, None);
+    }
+
+    /// `send_path` gibi; `group` verilirse dosya o gruba gönderilmiş sayılır.
+    pub fn send_path_to_group(
+        &self,
+        addr: SocketAddr,
+        peer_id: String,
+        msg_id: String,
+        path: PathBuf,
+        group: Option<protocol::GroupRef>,
+    ) {
         let net = self.clone();
         thread::spawn(move || {
             let cancel = net.register(&msg_id);
-            let res = net.do_send(addr, &peer_id, &msg_id, &path, &cancel);
+            let res = net.do_send(addr, &peer_id, &msg_id, &path, group, &cancel);
             net.unregister(&msg_id, &cancel);
             net.emit(match res {
                 Ok(skipped) => NetEvent::Completed {
@@ -1284,6 +1305,7 @@ impl Net {
         peer_id: &str,
         msg_id: &str,
         path: &Path,
+        group: Option<protocol::GroupRef>,
         cancel: &AtomicBool,
     ) -> io::Result<u64> {
         let meta = fs::metadata(path)?;
@@ -1325,6 +1347,7 @@ impl Net {
                 is_dir,
                 total_size,
                 file_count,
+                group,
             },
         )?;
         let accept: Accept = protocol::read_frame(&mut s)?;
@@ -2167,6 +2190,7 @@ mod tests {
             "y1".into(),
             "Saat 3'te".into(),
             Some(quote.clone()),
+            None,
         );
         let NetEvent::IncomingText { reply_to, text, .. } =
             wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingText { .. }))
@@ -2237,6 +2261,58 @@ mod tests {
                 | NetEvent::Reacted { .. }
                 | NetEvent::Nudged { .. }
         )));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn group_info_travels_with_messages_and_files() {
+        let d = temp_dir("grup");
+        let (a, rx_a) = start("A", &d);
+        let (b, rx_b) = start("B", &d);
+        pair_up(&a, "A", &b, "B");
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+        let g = protocol::GroupRef {
+            id: "grup-1".into(),
+            name: "Ev ve Ofis".into(),
+            members: vec![
+                protocol::Member {
+                    id: "A".into(),
+                    name: "Test A".into(),
+                },
+                protocol::Member {
+                    id: "B".into(),
+                    name: "Test B".into(),
+                },
+            ],
+            rev: 1,
+            gmid: "ortak".into(),
+        };
+        a.send_reply(
+            addr_b,
+            "B".into(),
+            "g1".into(),
+            "gruba selam".into(),
+            None,
+            Some(g.clone()),
+        );
+        let NetEvent::IncomingText { group, .. } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingText { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(group.as_ref(), Some(&g));
+        completed(&rx_a, "g1");
+
+        let src = d.join("grup-dosyasi.txt");
+        fs::write(&src, b"icerik").unwrap();
+        a.send_path_to_group(addr_b, "B".into(), "g2".into(), src, Some(g.clone()));
+        let NetEvent::IncomingTransfer { group, .. } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::IncomingTransfer { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(group, Some(g));
+        completed(&rx_a, "g2");
         fs::remove_dir_all(d).unwrap();
     }
 

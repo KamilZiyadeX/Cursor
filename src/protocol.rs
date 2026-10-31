@@ -126,6 +126,9 @@ pub enum Packet {
         /// Yanıtlanan mesaj (eski sürümler bu alanı göndermez)
         #[serde(default)]
         reply_to: Option<ReplyRef>,
+        /// Grup mesajıysa grubun bilgisi
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<GroupRef>,
     },
     /// Gönderenin daha önce yolladığı bir mesajı iki taraftan da siler
     Delete { from: From, msg_id: String },
@@ -160,7 +163,31 @@ pub enum Packet {
         is_dir: bool,
         total_size: u64,
         file_count: u64,
+        /// Gruba gönderilen dosyaysa grubun bilgisi
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<GroupRef>,
     },
+}
+
+/// Grup bilgisi. Grup mesajlarıyla birlikte gider; böylece alıcıda grup
+/// kendiliğinden oluşur, adı ve üyeleri güncel kalır.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GroupRef {
+    pub id: String,
+    pub name: String,
+    /// Tüm üyeler (gönderen dahil)
+    pub members: Vec<Member>,
+    /// Grup bilgisinin sürümü (ms); daha yeni olan eskisinin yerini alır
+    pub rev: i64,
+    /// Bu mesajın gruptaki ortak kimliği (her üyeye giden kopya aynı kimliği
+    /// taşır; tepkiler bunun üzerinden herkese yayılır)
+    pub gmid: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
 }
 
 /// Yanıtlanan mesaja kısa bir başvuru (alıntı olarak gösterilir).
@@ -369,6 +396,7 @@ mod tests {
             is_dir: true,
             total_size: 1 << 40,
             file_count: 12345,
+            group: None,
         };
         let mut buf = Vec::new();
         write_magic(&mut buf).unwrap();
