@@ -109,6 +109,7 @@ struct Settings {
     close_to_tray: bool,
     notifications: bool,
     notification_sound: bool,
+    windows_sound: bool,
     autostart: bool,
     has_password: bool,
     pw_current: String,
@@ -378,7 +379,8 @@ impl LanChatApp {
             &self.root_dir,
             title,
             &desktop::preview(body),
-            self.cfg.notification_sound && peer_id.is_some(),
+            (self.cfg.notification_sound && peer_id.is_some())
+                .then(|| sound_kind(self.cfg.windows_sound)),
             peer_id,
             self.desk_tx.clone(),
             move || ctx.request_repaint(),
@@ -1112,6 +1114,7 @@ impl LanChatApp {
                         close_to_tray: self.cfg.close_to_tray,
                         notifications: self.cfg.notifications,
                         notification_sound: self.cfg.notification_sound,
+                        windows_sound: self.cfg.windows_sound,
                         autostart: desktop::autostart_enabled(&self.cfg.id),
                         has_password: self.profile.has_password(),
                         pw_current: String::new(),
@@ -2062,6 +2065,16 @@ impl LanChatApp {
                     ui.checkbox(&mut s.notifications, "Yeni mesaj ve dosyalarda bildirim göster");
                     ui.add_enabled_ui(s.notifications, |ui| {
                         ui.checkbox(&mut s.notification_sound, "Bildirim sesi çal");
+                        ui.add_enabled_ui(s.notification_sound, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(24.0);
+                                ui.radio_value(&mut s.windows_sound, false, "LanChat (dıdıt dıt)");
+                                ui.radio_value(&mut s.windows_sound, true, "Windows sesi");
+                                if ui.button("▶ Dinle").clicked() {
+                                    desktop::play_sound(sound_kind(s.windows_sound));
+                                }
+                            });
+                        });
                     });
                     ui.add_space(10.0);
                 }
@@ -2216,6 +2229,7 @@ impl LanChatApp {
             self.cfg.close_to_tray = s.close_to_tray;
             self.cfg.notifications = s.notifications;
             self.cfg.notification_sound = s.notification_sound;
+            self.cfg.windows_sound = s.windows_sound;
             if desktop::HAS_TRAY
                 && s.autostart != desktop::autostart_enabled(&self.cfg.id)
                 && let Err(e) = desktop::set_autostart(&self.cfg.id, s.autostart)
@@ -2736,6 +2750,14 @@ impl eframe::App for LanChatApp {
 }
 
 /* ------------------------------ Yardımcılar ------------------------------ */
+
+fn sound_kind(windows_sound: bool) -> desktop::SoundKind {
+    if windows_sound {
+        desktop::SoundKind::Windows
+    } else {
+        desktop::SoundKind::LanChat
+    }
+}
 
 /// Üst çubuktaki küçük logo: küçük boyutlar için çizilmiş sade sürüm.
 pub fn small_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {

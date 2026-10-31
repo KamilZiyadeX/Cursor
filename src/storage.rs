@@ -32,6 +32,9 @@ pub struct Config {
     /// Bildirimle birlikte ses çal
     #[serde(default = "yes")]
     pub notification_sound: bool,
+    /// LanChat'in kendi sesi yerine Windows'un bildirim sesini kullan
+    #[serde(default)]
+    pub windows_sound: bool,
     /// "Tepside çalışmaya devam ediyor" bilgisi gösterildi mi?
     #[serde(default)]
     pub tray_hint_shown: bool,
@@ -240,6 +243,7 @@ impl Config {
             close_to_tray: true,
             notifications: true,
             notification_sound: true,
+            windows_sound: false,
             tray_hint_shown: false,
         }
     }

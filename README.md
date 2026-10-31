@@ -65,7 +65,7 @@ Her hesaba **⚙ Ayarlar → Hesap şifresi** bölümünden şifre konabilir; zo
 - **⚙ Ayarlar → Masaüstü** bölümünden:
   - **Windows açılınca bu hesabı arka planda başlat**: Bilgisayar açılınca LanChat pencere göstermeden, simge olarak başlar. Her hesap için ayrı ayarlanır. (Hesaba şifre konduysa açılışta şifre sorulur.)
   - **Pencere kapatılınca simgede çalışmaya devam et**: Kapatırsanız ✕ programı tamamen kapatır.
-  - **Bildirim göster** ve **Bildirim sesi çal**.
+  - **Bildirim göster** ve **Bildirim sesi çal**. Ses olarak LanChat'in kendi sesi (ağır metalik vuruşlarla “dıdıt dıt”) ya da Windows'un bildirim sesi seçilebilir; **▶ Dinle** ile denenebilir. LanChat sesi bir dosyadan okunmaz, program içinde sentezlenir (`src/sound.rs`).
 
 Bir hesap zaten açıkken (simgede gizli olsa bile) LanChat'e tekrar tıklanırsa ikinci bir kopya açılmaz; açık olan pencere öne gelir.
 
@@ -164,6 +164,7 @@ Kaynak kod düzeni:
 | `src/vault.rs`    | Hesap şifresiyle diskte şifreli saklama      |
 | `src/update.rs`   | Ağdan indirilen yeni sürümü kurma            |
 | `src/desktop.rs`  | Sistem tepsisi, Windows ile başlama, bildirimler |
+| `src/sound.rs`    | Bildirim sesi (sentezlenen “dıdıt dıt”)       |
 | `src/shell_icon.rs` | Simge değişince Windows Gezgini'ni yenileme |
 | `build.rs`        | Windows'ta logoyu .exe dosyasına gömer       |
 | `assets/icon/`    | Logo: tüm simge boyutlarında PNG ve `lanchat.ico` |

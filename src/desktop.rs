@@ -14,6 +14,16 @@ pub enum DesktopEvent {
     Quit,
 }
 
+/// Bildirim sesi
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum SoundKind {
+    /// LanChat'in kendi sesi ("dıdıt dıt")
+    LanChat,
+    /// Windows'un anlık ileti sesi
+    Windows,
+}
+
 /// Bu platformda sistem tepsisi var mı?
 pub const HAS_TRAY: bool = cfg!(windows);
 
@@ -243,13 +253,34 @@ mod imp {
         id
     }
 
-    /// Windows'un "anlık ileti" bildirim sesini çalar (yoksa varsayılan sesi).
-    fn play_sound() {
-        use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC};
-        let alias = wide("Notification.IM");
-        // SAFETY: SND_ASYNC ile ses kopyalanarak çalınır; dizi çağrı süresince geçerli.
-        unsafe {
-            PlaySoundW(alias.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC);
+    /// Bildirim sesini çalar (beklemeden, arka planda).
+    pub fn play_sound(kind: SoundKind) {
+        use std::sync::OnceLock;
+        use windows_sys::Win32::Media::Audio::{
+            PlaySoundW, SND_ALIAS, SND_ASYNC, SND_MEMORY, SND_NODEFAULT,
+        };
+        // SND_ASYNC ile çalınan bellekteki ses, çalma bitene kadar yerinde
+        // durmalıdır: bu yüzden program boyunca yaşayan bir değişkende tutulur.
+        static WAV: OnceLock<Vec<u8>> = OnceLock::new();
+        match kind {
+            SoundKind::LanChat => {
+                let wav = WAV.get_or_init(crate::sound::notification_wav);
+                // SAFETY: `wav` 'static ömürlüdür; SND_MEMORY ile işaretçi WAV verisini gösterir.
+                unsafe {
+                    PlaySoundW(
+                        wav.as_ptr().cast(),
+                        std::ptr::null_mut(),
+                        SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+                    );
+                }
+            }
+            SoundKind::Windows => {
+                let alias = wide("Notification.IM");
+                // SAFETY: SND_ALIAS ile ad, çağrı sırasında okunur; dizi o sürece geçerli.
+                unsafe {
+                    PlaySoundW(alias.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC);
+                }
+            }
         }
     }
 
@@ -257,15 +288,15 @@ mod imp {
         icon_dir: &Path,
         title: &str,
         body: &str,
-        sound: bool,
+        sound: Option<SoundKind>,
         peer_id: Option<String>,
         events: Sender<DesktopEvent>,
         wake: impl Fn() + Send + Sync + Clone + 'static,
     ) {
         use tauri_winrt_notification::Toast;
         // Ses bildirimden bağımsız çalınır: bildirim gösterilemese bile duyulsun
-        if sound {
-            play_sound();
+        if let Some(kind) = sound {
+            play_sound(kind);
         }
         let icon_dir = icon_dir.to_path_buf();
         let (title, body) = (title.to_string(), body.to_string());
@@ -402,11 +433,13 @@ mod imp {
 
     pub fn init_notifications(_icon_dir: &Path) {}
 
+    pub fn play_sound(_kind: SoundKind) {}
+
     pub fn notify(
         _icon_dir: &Path,
         _title: &str,
         _body: &str,
-        _sound: bool,
+        _sound: Option<SoundKind>,
         _peer_id: Option<String>,
         _events: Sender<DesktopEvent>,
         _wake: impl Fn() + Send + Sync + Clone + 'static,
@@ -431,7 +464,8 @@ mod imp {
 }
 
 pub use imp::{
-    Tray, autostart_enabled, init_notifications, notify, refresh_autostart, set_autostart,
+    Tray, autostart_enabled, init_notifications, notify, play_sound, refresh_autostart,
+    set_autostart,
 };
 
 /// Yanıp sönme aralığı

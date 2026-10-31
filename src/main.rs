@@ -8,6 +8,7 @@ mod protocol;
 mod root;
 mod secure;
 mod shell_icon;
+mod sound;
 mod storage;
 mod update;
 mod vault;
