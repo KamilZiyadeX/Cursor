@@ -1,6 +1,7 @@
 //! Ayarlar ve sohbet geçmişinin diske kaydedilmesi.
 
 use crate::secure::{Identity, PublicKey};
+use crate::vault::{self, VaultError, VaultKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -231,9 +232,20 @@ pub struct ProfileInfo {
     pub dir: PathBuf,
     /// Başka bir LanChat penceresinde açık mı?
     pub in_use: bool,
+    /// Açılışta şifre soruluyor mu?
+    pub has_password: bool,
 }
 
-/// Açılmış (kilitlenmiş) bir hesap. Kilit, bu değer yaşadığı sürece tutulur;
+/// Başka pencerelerin açmasına karşı kilitlenmiş ama henüz açılmamış hesap.
+/// Şifreli hesapta anahtar ve geçmiş, şifre girilene kadar çözülmez.
+#[derive(Debug)]
+pub struct LockedProfile {
+    pub dir: PathBuf,
+    pub cfg: Config,
+    lock: fs::File,
+}
+
+/// Açılmış hesap. Kilit, bu değer yaşadığı sürece tutulur;
 /// böylece aynı hesap iki pencerede birden açılamaz.
 #[derive(Debug)]
 pub struct Profile {
@@ -241,7 +253,40 @@ pub struct Profile {
     pub cfg: Config,
     /// Hesabın şifreleme anahtarı
     pub identity: Identity,
+    /// Hesap şifreliyse, şifreden türetilmiş anahtar
+    vault: Option<VaultKey>,
     _lock: fs::File,
+}
+
+const KEY_FILE: &str = "key.json";
+const HISTORY_FILE: &str = "history.json";
+
+fn enc_name(name: &str) -> String {
+    format!("{name}.enc")
+}
+
+/// Bu klasördeki hesabın şifresi var mı?
+pub fn has_password(dir: &Path) -> bool {
+    dir.join(enc_name(KEY_FILE)).exists()
+}
+
+/// Dosyayı önce geçici adla yazıp sonra yerine taşır.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
+}
+
+/// Şifresiz kopyayı silmeden önce üzerine sıfır yazar (en iyi çabayla).
+fn wipe(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::write(path, vec![0u8; meta.len() as usize]);
+        let _ = fs::remove_file(path);
+    }
 }
 
 #[derive(Debug)]
@@ -311,6 +356,7 @@ pub fn list_profiles(root: &Path) -> Vec<ProfileInfo> {
                         id: cfg.id,
                         name: cfg.name,
                         in_use: is_locked(&dir),
+                        has_password: has_password(&dir),
                         dir,
                     })
                 })
@@ -347,22 +393,149 @@ pub fn create_profile(root: &Path, name: &str) -> io::Result<ProfileInfo> {
         name: cfg.name,
         dir,
         in_use: false,
+        has_password: false,
     })
 }
 
-/// Hesabı açar ve kilitler.
-pub fn open_profile(dir: &Path) -> Result<Profile, ProfileError> {
+/// Hesabı başka pencerelere karşı kilitler. Açmak için `unlock` çağrılır.
+pub fn open_profile(dir: &Path) -> Result<LockedProfile, ProfileError> {
     let cfg = Config::load(dir).map_err(ProfileError::Io)?;
     let lock = lock_file(dir).map_err(ProfileError::Io)?;
     match lock.try_lock() {
-        Ok(()) => Ok(Profile {
+        Ok(()) => Ok(LockedProfile {
             dir: dir.to_path_buf(),
             cfg,
-            identity: Identity::load_or_create(dir).map_err(ProfileError::Io)?,
-            _lock: lock,
+            lock,
         }),
         Err(fs::TryLockError::WouldBlock) => Err(ProfileError::InUse),
         Err(fs::TryLockError::Error(e)) => Err(ProfileError::Io(e)),
+    }
+}
+
+#[derive(Debug)]
+pub enum UnlockError {
+    WrongPassword,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for UnlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnlockError::WrongPassword => write!(f, "Şifre yanlış"),
+            UnlockError::Io(e) => write!(f, "Hesap açılamadı: {e}"),
+        }
+    }
+}
+
+impl LockedProfile {
+    pub fn has_password(&self) -> bool {
+        has_password(&self.dir)
+    }
+
+    /// Hesabı açar. Şifresiz hesapta `password` yok sayılır.
+    /// Başarısızsa kilit bırakılmadan hesap geri verilir (yeniden denemek için).
+    // Hata durumunda kilitli hesap geri verilir (kilidi bırakmadan yeniden denemek için);
+    // bu nadir yol için büyük hata türü sorun değil.
+    #[allow(clippy::result_large_err)]
+    pub fn unlock(self, password: &str) -> Result<Profile, (LockedProfile, UnlockError)> {
+        if !self.has_password() {
+            return match Identity::load_or_create(&self.dir) {
+                Ok(identity) => Ok(self.into_profile(identity, None)),
+                Err(e) => Err((self, UnlockError::Io(e))),
+            };
+        }
+        let data = match fs::read(self.dir.join(enc_name(KEY_FILE))) {
+            Ok(d) => d,
+            Err(e) => return Err((self, UnlockError::Io(e))),
+        };
+        let (key, plain) = match vault::unlock(password, &data) {
+            Ok(r) => r,
+            Err(VaultError::WrongPassword) => return Err((self, UnlockError::WrongPassword)),
+            Err(e) => return Err((self, UnlockError::Io(io::Error::other(e)))),
+        };
+        match Identity::from_json(&plain) {
+            Ok(identity) => Ok(self.into_profile(identity, Some(key))),
+            Err(e) => Err((self, UnlockError::Io(e))),
+        }
+    }
+
+    /// Şifresi unutulan hesabı sıfırlar: şifreli geçmiş ve anahtar silinir, yeni
+    /// bir anahtar üretilir. Ad, ayarlar ve indirilen dosyalar korunur.
+    pub fn reset_forgotten(self) -> io::Result<Profile> {
+        let _ = fs::remove_file(self.dir.join(enc_name(KEY_FILE)));
+        let _ = fs::remove_file(self.dir.join(enc_name(HISTORY_FILE)));
+        let identity = Identity::load_or_create(&self.dir)?;
+        Ok(self.into_profile(identity, None))
+    }
+
+    fn into_profile(self, identity: Identity, vault: Option<VaultKey>) -> Profile {
+        Profile {
+            dir: self.dir,
+            cfg: self.cfg,
+            identity,
+            vault,
+            _lock: self.lock,
+        }
+    }
+}
+
+impl Profile {
+    pub fn has_password(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    pub fn load_history(&self) -> History {
+        match &self.vault {
+            None => History::load(&self.dir),
+            Some(key) => fs::read(self.dir.join(enc_name(HISTORY_FILE)))
+                .ok()
+                .and_then(|d| key.decrypt(&d).ok())
+                .map(|plain| History::from_bytes(&plain))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn save_history(&self, h: &History) -> io::Result<()> {
+        match &self.vault {
+            None => h.save(&self.dir),
+            Some(key) => write_atomic(
+                &self.dir.join(enc_name(HISTORY_FILE)),
+                &key.encrypt(&serde_json::to_vec(h)?),
+            ),
+        }
+    }
+
+    /// Mevcut şifre doğru mu? (Şifresiz hesapta her zaman doğru.)
+    pub fn check_password(&self, password: &str) -> bool {
+        self.vault.as_ref().is_none_or(|k| k.matches(password))
+    }
+
+    /// Şifre koyar, değiştirir (`Some`) ya da kaldırır (`None`).
+    /// Anahtar ve sohbet geçmişi yeni duruma göre yeniden yazılır.
+    pub fn set_password(&mut self, password: Option<&str>, history: &History) -> io::Result<()> {
+        let key_plain = self.dir.join(KEY_FILE);
+        let hist_plain = self.dir.join(HISTORY_FILE);
+        let key_enc = self.dir.join(enc_name(KEY_FILE));
+        let hist_enc = self.dir.join(enc_name(HISTORY_FILE));
+        match password {
+            Some(pw) => {
+                let key = VaultKey::new(pw);
+                write_atomic(&hist_enc, &key.encrypt(&serde_json::to_vec(history)?))?;
+                // Anahtar dosyası en son yazılır: hesabın şifreli olup olmadığını o belirler
+                write_atomic(&key_enc, &key.encrypt(&self.identity.to_json()))?;
+                wipe(&key_plain);
+                wipe(&hist_plain);
+                self.vault = Some(key);
+            }
+            None => {
+                history.save(&self.dir)?;
+                write_atomic(&key_plain, &self.identity.to_json())?;
+                let _ = fs::remove_file(&key_enc);
+                let _ = fs::remove_file(&hist_enc);
+                self.vault = None;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -380,10 +553,13 @@ pub fn set_last_profile(root: &Path, id: &str) -> io::Result<()> {
 
 impl History {
     pub fn load(dir: &Path) -> History {
-        let mut h: History = fs::read(dir.join("history.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        fs::read(dir.join("history.json"))
+            .map(|b| History::from_bytes(&b))
+            .unwrap_or_default()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> History {
+        let mut h: History = serde_json::from_slice(bytes).unwrap_or_default();
         // Uygulama kapanırken yarım kalan aktarımlar
         for m in &mut h.messages {
             if m.state == MsgState::Pending {
@@ -427,13 +603,118 @@ mod tests {
         assert_ne!(ca.download_dir, cb.download_dir);
 
         // Aynı hesap iki kez açılamaz, diğeri açılabilir
-        let opened = open_profile(&a.dir).unwrap();
+        let opened = open_profile(&a.dir).unwrap().unlock("").unwrap();
         assert!(matches!(open_profile(&a.dir), Err(ProfileError::InUse)));
         let in_use: Vec<bool> = list_profiles(&root).iter().map(|p| p.in_use).collect();
         assert_eq!(in_use.iter().filter(|x| **x).count(), 1);
         let _b = open_profile(&b.dir).unwrap();
         drop(opened);
         assert!(open_profile(&a.dir).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn sample_history(text: &str) -> History {
+        History {
+            peers: vec![],
+            messages: vec![ChatMessage::new(
+                "m1".into(),
+                "p".into(),
+                true,
+                Body::Text(text.into()),
+                MsgState::Done,
+            )],
+        }
+    }
+
+    fn text_of(h: &History) -> &str {
+        match &h.messages[0].body {
+            Body::Text(t) => t,
+            _ => panic!(),
+        }
+    }
+
+    /// Klasördeki tüm dosyalarda düz metin arar.
+    fn plaintext_on_disk(dir: &Path, needle: &str) -> bool {
+        fs::read_dir(dir).unwrap().filter_map(Result::ok).any(|e| {
+            fs::read(e.path())
+                .is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        })
+    }
+
+    #[test]
+    fn password_encrypts_history_and_key_on_disk() {
+        let root = temp_root();
+        let info = create_profile(&root, "Gizli").unwrap();
+
+        // Şifresiz açılır, geçmiş düz metin
+        let mut p = open_profile(&info.dir).unwrap().unlock("").unwrap();
+        let public = p.identity.public;
+        let h = sample_history("GIZLIMESAJ-42");
+        p.save_history(&h).unwrap();
+        assert!(plaintext_on_disk(&info.dir, "GIZLIMESAJ-42"));
+        assert!(!p.has_password());
+
+        // Şifre konunca diskte ne mesaj ne de gizli anahtar düz metin kalır
+        p.set_password(Some("parola1"), &h).unwrap();
+        assert!(p.has_password());
+        assert!(!plaintext_on_disk(&info.dir, "GIZLIMESAJ-42"));
+        assert!(!info.dir.join("key.json").exists());
+        assert!(!info.dir.join("history.json").exists());
+        assert!(list_profiles(&root)[0].has_password);
+        drop(p);
+
+        // Yanlış şifre: açılmaz, hesap kilitli kalır ve yeniden denenebilir
+        let locked = open_profile(&info.dir).unwrap();
+        assert!(locked.has_password());
+        let (locked, err) = locked.unlock("yanlis").unwrap_err();
+        assert!(matches!(err, UnlockError::WrongPassword));
+        assert!(matches!(open_profile(&info.dir), Err(ProfileError::InUse)));
+
+        // Doğru şifre: aynı anahtar ve geçmiş
+        let mut p = locked.unlock("parola1").unwrap();
+        assert_eq!(p.identity.public, public);
+        assert_eq!(text_of(&p.load_history()), "GIZLIMESAJ-42");
+        assert!(p.check_password("parola1"));
+        assert!(!p.check_password("parola2"));
+
+        // Şifre değiştir: eskisi artık açmaz
+        p.set_password(Some("yeni-parola"), &p.load_history())
+            .unwrap();
+        drop(p);
+        let (locked, _) = open_profile(&info.dir)
+            .unwrap()
+            .unlock("parola1")
+            .unwrap_err();
+        let mut p = locked.unlock("yeni-parola").unwrap();
+        assert_eq!(text_of(&p.load_history()), "GIZLIMESAJ-42");
+
+        // Şifreyi kaldır: tekrar şifresiz açılır, her şey yerinde
+        let h = p.load_history();
+        p.set_password(None, &h).unwrap();
+        drop(p);
+        assert!(!has_password(&info.dir));
+        let p = open_profile(&info.dir).unwrap().unlock("").unwrap();
+        assert_eq!(p.identity.public, public);
+        assert_eq!(text_of(&p.load_history()), "GIZLIMESAJ-42");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forgotten_password_reset_keeps_settings_but_drops_secrets() {
+        let root = temp_root();
+        let info = create_profile(&root, "Unutkan").unwrap();
+        let mut p = open_profile(&info.dir).unwrap().unlock("").unwrap();
+        let old_key = p.identity.public;
+        let h = sample_history("ESKI-GECMIS");
+        p.set_password(Some("unuttum"), &h).unwrap();
+        drop(p);
+
+        let p = open_profile(&info.dir).unwrap().reset_forgotten().unwrap();
+        assert_eq!(p.cfg.name, "Unutkan");
+        assert!(!p.has_password());
+        assert_ne!(p.identity.public, old_key);
+        assert!(p.load_history().messages.is_empty());
+        assert!(!has_password(&info.dir));
         fs::remove_dir_all(root).unwrap();
     }
 

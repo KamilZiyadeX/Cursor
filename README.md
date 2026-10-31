@@ -38,6 +38,19 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 
 İlk hesap gelen dosyaları `İndirilenler\LanChat`, sonraki hesaplar `İndirilenler\LanChat (hesap adı)` klasörüne kaydeder; **⚙ Ayarlar**'dan değiştirilebilir. Aynı bilgisayarda birden çok hesap açıkken her biri mesaj için sıradaki portu kullanır (47821, 47822, …).
 
+### Hesap şifresi (isteğe bağlı)
+
+Her hesaba **⚙ Ayarlar → Hesap şifresi** bölümünden şifre konabilir; zorunlu değildir. Şifre konan hesap:
+
+- açılırken şifre sorar (yanlış şifrede açılmaz),
+- sohbet geçmişini ve hesabın şifreleme anahtarını bilgisayarda **şifreli** saklar. Bilgisayara erişen biri dosyaları kopyalasa bile şifre olmadan okuyamaz.
+
+Şifre aynı bölümden değiştirilebilir ya da kaldırılabilir; ikisi için de mevcut şifre istenir. Hesap seçme ekranında şifreli hesapların yanında 🔒 görünür.
+
+> **Şifreyi unutursanız kurtarılamaz.** Giriş ekranındaki **Şifremi unuttum** ile hesap sıfırlanabilir: sohbet geçmişi silinir ve hesabın anahtarı yenilenir (eşleştiğiniz cihazlarla yeniden eşleşmeniz gerekir). Adınız, ayarlarınız ve indirilen dosyalar korunur.
+>
+> Gelen dosyalar indirme klasörüne normal dosya olarak kaydedilir; hesap şifresi onları şifrelemez.
+
 ### Windows güvenlik duvarı
 
 İlk açılışta Windows “Bu uygulamaya ağ erişimi izni verilsin mi?” diye sorar. **Özel ağlar** kutusunu işaretleyip **İzin ver** deyin. Bu adım atlanırsa diğer bilgisayar sizi göremez ya da size gönderemez.
@@ -117,6 +130,7 @@ Kaynak kod düzeni:
 | `src/storage.rs`  | Hesaplar, ayarlar ve sohbet geçmişinin kaydı |
 | `src/root.rs`     | Açılışta hesap seçimi                        |
 | `src/secure.rs`   | Şifreleme (Noise), anahtarlar, eşleştirme kodu |
+| `src/vault.rs`    | Hesap şifresiyle diskte şifreli saklama      |
 | `build.rs`        | Windows'ta logoyu .exe dosyasına gömer       |
 | `assets/icon/`    | Logo: tüm simge boyutlarında PNG ve `lanchat.ico` |
 | `assets/logo/`    | Logonun kaynak SVG dosyaları                 |
@@ -138,7 +152,7 @@ Her hesabın ayarları (`config.json`) ve sohbet geçmişi (`history.json`) bu k
 - **Kimlik doğrulama**: Eşleşmemiş cihazlardan gelen mesaj ve dosyalar reddedilir (kullanıcıya bildirilir). Mesaj gönderirken de karşı tarafın anahtarı kontrol edilir; başka biri o kişinin yerine geçemez.
 - Aynı bilgisayardaki kendi hesaplarınız birbirine eşleştirmesiz güvenir (aralarındaki trafik yine şifrelidir).
 - Hız: Şifreleme saniyede yüzlerce MB işler; kablolu gigabit ağda bile hızı düşürmez.
-- Gizli anahtar hesabın veri klasöründe (`key.json`) durur. Bu klasör yalnızca sizin Windows kullanıcınıza açıktır.
+- Gizli anahtar hesabın veri klasöründe durur. Bu klasör yalnızca sizin Windows kullanıcınıza açıktır. Hesaba şifre konduysa anahtar ve sohbet geçmişi ayrıca şifrelenir: şifreden Argon2id ile (64 MiB bellek, 3 tur) bir anahtar türetilir ve dosyalar XChaCha20-Poly1305 ile şifrelenir (`key.json.enc`, `history.json.enc`).
 - Bu sürüm eski (şifresiz) sürümlerle konuşamaz; iki bilgisayarda da yeni sürümü kullanın.
 
 Gelen dosyalar otomatik kaydedilir ama otomatik açılmaz. Eşleştirdiğiniz kişiden bile beklemediğiniz bir dosya gelirse açmadan önce dikkatli olun.

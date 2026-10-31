@@ -7,6 +7,7 @@ mod protocol;
 mod root;
 mod secure;
 mod storage;
+mod vault;
 
 use eframe::egui;
 

@@ -5,9 +5,10 @@
 //!   lanchat --hesap-id <kimlik>    (uygulamanın kendi kullandığı) kimlikle açar
 
 use crate::app::{self, LanChatApp};
-use crate::storage::{self, ProfileError, ProfileInfo};
+use crate::storage::{self, LockedProfile, Profile, ProfileError, ProfileInfo, UnlockError};
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, TextEdit};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 enum Cli {
@@ -48,9 +49,24 @@ struct Picker {
     refreshed: Instant,
 }
 
+type UnlockResult = Result<Profile, (LockedProfile, UnlockError)>;
+
+/// Şifreli bir hesabın giriş ekranı.
+struct Unlock {
+    name: String,
+    /// Şifre denenirken arka plan iş parçacığına geçer
+    locked: Option<LockedProfile>,
+    working: Option<Receiver<UnlockResult>>,
+    password: String,
+    error: Option<String>,
+    confirm_reset: bool,
+    focused: bool,
+}
+
 pub struct Root {
     root_dir: PathBuf,
     chat: Option<LanChatApp>,
+    unlock: Option<Unlock>,
     picker: Picker,
     title_set: bool,
     logo: egui::TextureHandle,
@@ -69,6 +85,7 @@ impl Root {
             },
             root_dir,
             chat: None,
+            unlock: None,
             title_set: false,
             logo: app::large_logo_texture(&cc.egui_ctx),
         };
@@ -124,15 +141,179 @@ impl Root {
 
     fn try_open(&mut self, ctx: &egui::Context, p: &ProfileInfo) {
         match storage::open_profile(&p.dir) {
-            Ok(profile) => {
-                self.chat = Some(LanChatApp::new(ctx, self.root_dir.clone(), profile));
+            Ok(locked) if locked.has_password() => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                    "LanChat — {} (şifreli)",
+                    locked.cfg.name
+                )));
+                self.unlock = Some(Unlock {
+                    name: locked.cfg.name.clone(),
+                    locked: Some(locked),
+                    working: None,
+                    password: String::new(),
+                    error: None,
+                    confirm_reset: false,
+                    focused: false,
+                });
             }
+            Ok(locked) => match locked.unlock("") {
+                Ok(profile) => self.start_chat(ctx, profile),
+                Err((_, e)) => self.picker.message = Some(e.to_string()),
+            },
             Err(e) => {
                 self.picker.message = Some(match e {
                     ProfileError::InUse => format!("“{}” başka bir pencerede zaten açık", p.name),
                     other => other.to_string(),
                 });
                 self.picker.profiles = storage::list_profiles(&self.root_dir);
+            }
+        }
+    }
+
+    fn start_chat(&mut self, ctx: &egui::Context, profile: Profile) {
+        self.unlock = None;
+        self.chat = Some(LanChatApp::new(ctx, self.root_dir.clone(), profile));
+    }
+
+    fn unlock_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Some(u) = &mut self.unlock else { return };
+
+        // Arka planda denenen şifrenin sonucu
+        if let Some(rx) = &u.working {
+            match rx.try_recv() {
+                Ok(Ok(profile)) => {
+                    self.start_chat(&ctx, profile);
+                    return;
+                }
+                Ok(Err((locked, e))) => {
+                    u.locked = Some(locked);
+                    u.working = None;
+                    u.password.clear();
+                    u.focused = false;
+                    u.error = Some(match e {
+                        UnlockError::WrongPassword => "Şifre yanlış. Tekrar deneyin.".into(),
+                        other => other.to_string(),
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(50))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    u.working = None;
+                    u.error = Some("Hesap açılamadı".into());
+                }
+            }
+        }
+
+        let mut submit = false;
+        let mut back = false;
+        let mut reset = false;
+        let busy = u.working.is_some();
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(56.0);
+                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                ui.add_space(10.0);
+                ui.label(RichText::new(&u.name).size(24.0).strong());
+                ui.add_space(4.0);
+
+                if u.confirm_reset {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Şifre kurtarılamaz").size(17.0).strong());
+                    ui.add_space(6.0);
+                    ui.allocate_ui(egui::vec2(380.0, 0.0), |ui| {
+                        ui.add(egui::Label::new(
+                            "Hesabı sıfırlarsanız bu hesabın sohbet geçmişi silinir ve hesabın \
+                             şifreleme anahtarı yenilenir; eşleştiğiniz cihazlarla yeniden \
+                             eşleşmeniz gerekir. Adınız, ayarlarınız ve indirilen dosyalar korunur.",
+                        ).wrap());
+                    });
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 250.0).max(0.0) / 2.0);
+                        let danger = egui::Button::new(RichText::new("Hesabı sıfırla").strong().color(Color32::WHITE))
+                            .fill(Color32::from_rgb(200, 30, 30));
+                        if ui.add(danger).clicked() {
+                            reset = true;
+                        }
+                        if ui.button("Vazgeç").clicked() {
+                            u.confirm_reset = false;
+                        }
+                    });
+                    return;
+                }
+
+                ui.label(RichText::new("🔒 Bu hesap şifreli").weak());
+                ui.add_space(18.0);
+                let r = ui.add_enabled(
+                    !busy,
+                    TextEdit::singleline(&mut u.password)
+                        .password(true)
+                        .hint_text("Şifre")
+                        .desired_width(280.0),
+                );
+                if !u.focused {
+                    r.request_focus();
+                    u.focused = true;
+                }
+                if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(10.0);
+                if busy {
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 110.0).max(0.0) / 2.0);
+                        ui.spinner();
+                        ui.label("Açılıyor…");
+                    });
+                } else if ui
+                    .add_sized([280.0, 34.0], egui::Button::new(RichText::new("Aç").strong()))
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if let Some(e) = &u.error {
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::from_rgb(234, 88, 12), e);
+                }
+                ui.add_space(28.0);
+                ui.horizontal(|ui| {
+                    ui.add_space((ui.available_width() - 290.0).max(0.0) / 2.0);
+                    if ui.add_enabled(!busy, egui::Button::new("← Başka hesap seç").frame(false)).clicked() {
+                        back = true;
+                    }
+                    ui.add_space(24.0);
+                    if ui.add_enabled(!busy, egui::Button::new("Şifremi unuttum").frame(false)).clicked() {
+                        u.confirm_reset = true;
+                    }
+                });
+            });
+        });
+
+        if submit && !busy && !u.password.is_empty() {
+            if let Some(locked) = u.locked.take() {
+                let (tx, rx) = mpsc::channel();
+                let password = u.password.clone();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(locked.unlock(&password));
+                    ctx2.request_repaint();
+                });
+                u.working = Some(rx);
+                u.error = None;
+            }
+        } else if back {
+            // Kilidi bırak, hesap seçme ekranına dön
+            self.unlock = None;
+            self.title_set = false;
+            self.picker.message = None;
+            self.picker.profiles = storage::list_profiles(&self.root_dir);
+        } else if reset && let Some(locked) = u.locked.take() {
+            match locked.reset_forgotten() {
+                Ok(profile) => self.start_chat(&ctx, profile),
+                Err(e) => u.error = Some(format!("Hesap sıfırlanamadı: {e}")),
             }
         }
     }
@@ -189,6 +370,10 @@ impl Root {
                         for p in &self.picker.profiles {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(&p.name).size(15.0));
+                                if p.has_password {
+                                    ui.label(RichText::new("🔒").small().weak())
+                                        .on_hover_text("Şifreli hesap");
+                                }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if p.in_use {
                                         ui.label(
@@ -239,9 +424,12 @@ impl eframe::App for Root {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        match &mut self.chat {
-            Some(chat) => chat.ui(ui, frame),
-            None => self.picker_ui(ui),
+        if let Some(chat) = &mut self.chat {
+            chat.ui(ui, frame);
+        } else if self.unlock.is_some() {
+            self.unlock_ui(ui);
+        } else {
+            self.picker_ui(ui);
         }
     }
 

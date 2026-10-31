@@ -64,7 +64,18 @@ struct NewAccount {
     focused: bool,
 }
 
+enum PasswordAction {
+    Set(String),
+    Change { current: String, new: String },
+    Remove { current: String },
+}
+
 struct Settings {
+    has_password: bool,
+    pw_current: String,
+    pw_new: String,
+    pw_repeat: String,
+    pw_error: Option<String>,
     name: String,
     download_dir: PathBuf,
     manual_ips: Vec<String>,
@@ -80,7 +91,7 @@ pub struct LanChatApp {
     data_dir: PathBuf,
     cfg: Config,
     /// Açık hesap; kilidi pencere kapanana kadar tutar
-    _profile: Profile,
+    profile: Profile,
     logo: egui::TextureHandle,
     new_account: Option<NewAccount>,
     out_pair: Option<OutPair>,
@@ -107,7 +118,7 @@ impl LanChatApp {
     pub fn new(ctx: &egui::Context, root_dir: PathBuf, profile: Profile) -> Self {
         let data_dir = profile.dir.clone();
         let cfg = profile.cfg.clone();
-        let history = History::load(&data_dir);
+        let history = profile.load_history();
         let _ = storage::set_last_profile(&root_dir, &cfg.id);
 
         let local_registry = Some(storage::online_dir(&root_dir));
@@ -153,7 +164,7 @@ impl LanChatApp {
             root_dir,
             data_dir,
             cfg,
-            _profile: profile,
+            profile,
             logo,
             new_account: None,
             out_pair: None,
@@ -409,8 +420,8 @@ impl LanChatApp {
         }
     }
 
-    fn save_history(&mut self) {
-        let history = History {
+    fn current_history(&self) -> History {
+        History {
             peers: self
                 .peers
                 .iter()
@@ -421,8 +432,13 @@ impl LanChatApp {
                 })
                 .collect(),
             messages: self.messages.clone(),
-        };
-        if let Err(e) = history.save(&self.data_dir) {
+        }
+    }
+
+    fn save_history(&mut self) {
+        let history = self.current_history();
+        // Şifreli hesapta geçmiş şifreli yazılır
+        if let Err(e) = self.profile.save_history(&history) {
             self.show_toast(format!("Geçmiş kaydedilemedi: {e}"));
         }
         self.dirty = false;
@@ -590,6 +606,11 @@ impl LanChatApp {
                 ui.menu_button("👤 Hesaplar", |ui| self.accounts_menu(ui));
                 if ui.button("⚙ Ayarlar").clicked() {
                     self.settings = Some(Settings {
+                        has_password: self.profile.has_password(),
+                        pw_current: String::new(),
+                        pw_new: String::new(),
+                        pw_repeat: String::new(),
+                        pw_error: None,
                         name: self.cfg.name.clone(),
                         download_dir: self.cfg.download_dir.clone(),
                         manual_ips: self.cfg.manual_ips.clone(),
@@ -1130,6 +1151,8 @@ impl LanChatApp {
         let Some(s) = &mut self.settings else { return };
         let mut close = false;
         let mut apply = false;
+        let mut pw_action: Option<PasswordAction> = None;
+        let max_h = (ctx.content_rect().height() - 120.0).max(200.0);
 
         egui::Window::new("Ayarlar")
             .collapsible(false)
@@ -1137,6 +1160,7 @@ impl LanChatApp {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(420.0)
             .show(ctx, |ui| {
+              ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
                 ui.label(RichText::new("Adın").strong());
                 ui.label(RichText::new("Diğer bilgisayarlarda bu ad görünür (ör. “Kamil – Ofis”).").small().weak());
                 ui.add(TextEdit::singleline(&mut s.name).char_limit(40).desired_width(f32::INFINITY));
@@ -1150,6 +1174,65 @@ impl LanChatApp {
                             s.download_dir = d;
                         }
                 });
+                ui.add_space(10.0);
+
+                ui.label(RichText::new("Hesap şifresi").strong());
+                let pw_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
+                    ui.add(TextEdit::singleline(text).password(true).hint_text(hint).desired_width(260.0));
+                };
+                if s.has_password {
+                    ui.label(
+                        RichText::new("🔒 Bu hesap şifreli. Açılırken şifre sorulur; sohbet geçmişi ve hesabın anahtarı bilgisayarda şifreli saklanır.")
+                            .small()
+                            .weak(),
+                    );
+                    pw_field(ui, &mut s.pw_current, "Mevcut şifre");
+                    pw_field(ui, &mut s.pw_new, "Yeni şifre");
+                    pw_field(ui, &mut s.pw_repeat, "Yeni şifre (tekrar)");
+                    ui.horizontal(|ui| {
+                        if ui.button("Şifreyi değiştir").clicked() {
+                            if s.pw_current.is_empty() {
+                                s.pw_error = Some("Mevcut şifreyi yazın".into());
+                            } else if let Err(e) = validate_new_password(&s.pw_new, &s.pw_repeat) {
+                                s.pw_error = Some(e);
+                            } else {
+                                pw_action = Some(PasswordAction::Change {
+                                    current: s.pw_current.clone(),
+                                    new: s.pw_new.clone(),
+                                });
+                            }
+                        }
+                        if ui.button("Şifreyi kaldır").clicked() {
+                            if s.pw_current.is_empty() {
+                                s.pw_error = Some("Şifreyi kaldırmak için mevcut şifreyi yazın".into());
+                            } else {
+                                pw_action = Some(PasswordAction::Remove { current: s.pw_current.clone() });
+                            }
+                        }
+                    });
+                } else {
+                    ui.label(
+                        RichText::new("İsteğe bağlı. Şifre koyarsanız bu hesap açılırken şifre sorulur; sohbet geçmişi ve hesabın anahtarı bilgisayarda şifreli saklanır.")
+                            .small()
+                            .weak(),
+                    );
+                    pw_field(ui, &mut s.pw_new, "Yeni şifre");
+                    pw_field(ui, &mut s.pw_repeat, "Yeni şifre (tekrar)");
+                    if ui.button("🔒 Şifre koy").clicked() {
+                        match validate_new_password(&s.pw_new, &s.pw_repeat) {
+                            Ok(()) => pw_action = Some(PasswordAction::Set(s.pw_new.clone())),
+                            Err(e) => s.pw_error = Some(e),
+                        }
+                    }
+                }
+                if let Some(e) = &s.pw_error {
+                    ui.colored_label(Color32::from_rgb(220, 38, 38), e);
+                }
+                ui.label(
+                    RichText::new("Şifreyi unutursanız kurtarılamaz; hesap ancak sohbet geçmişi silinerek sıfırlanabilir. Gelen dosyalar indirme klasöründe şifresiz durur.")
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(10.0);
 
                 ui.label(RichText::new("Eşleşilmiş cihazlar").strong());
@@ -1222,7 +1305,13 @@ impl LanChatApp {
                         close = true;
                     }
                 });
+              });
             });
+
+        if let Some(action) = pw_action {
+            self.apply_password_action(action);
+            return;
+        }
 
         if apply {
             let s = self.settings.take().unwrap();
@@ -1247,6 +1336,41 @@ impl LanChatApp {
             }
         } else if close {
             self.settings = None;
+        }
+    }
+
+    fn apply_password_action(&mut self, action: PasswordAction) {
+        let history = self.current_history();
+        let (current, new) = match &action {
+            PasswordAction::Set(new) => (None, Some(new.as_str())),
+            PasswordAction::Change { current, new } => (Some(current.as_str()), Some(new.as_str())),
+            PasswordAction::Remove { current } => (Some(current.as_str()), None),
+        };
+        let result = if current.is_some_and(|c| !self.profile.check_password(c)) {
+            Err("Mevcut şifre yanlış".to_string())
+        } else {
+            self.profile
+                .set_password(new, &history)
+                .map_err(|e| format!("Şifre kaydedilemedi: {e}"))
+        };
+        let Some(s) = &mut self.settings else { return };
+        match result {
+            Ok(()) => {
+                s.has_password = self.profile.has_password();
+                s.pw_current.clear();
+                s.pw_new.clear();
+                s.pw_repeat.clear();
+                s.pw_error = None;
+                self.dirty = false;
+                self.show_toast(match action {
+                    PasswordAction::Set(_) => {
+                        "🔒 Şifre kondu; hesap bundan sonra şifreyle açılacak"
+                    }
+                    PasswordAction::Change { .. } => "🔒 Şifre değiştirildi",
+                    PasswordAction::Remove { .. } => "Şifre kaldırıldı; hesap şifresiz açılacak",
+                });
+            }
+            Err(e) => s.pw_error = Some(e),
         }
     }
 
@@ -1642,6 +1766,16 @@ pub fn setup_style(ctx: &egui::Context) {
             }
         }
     });
+}
+
+fn validate_new_password(new: &str, repeat: &str) -> Result<(), String> {
+    if new.chars().count() < 4 {
+        Err("Şifre en az 4 karakter olmalı".into())
+    } else if new != repeat {
+        Err("İki şifre aynı değil".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn new_id() -> String {

@@ -55,6 +55,22 @@ impl Identity {
         }
     }
 
+    /// Anahtar dosyasının içeriği (JSON).
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec_pretty(&KeyFile {
+            private: to_hex(&self.private),
+            public: to_hex(&self.public),
+        })
+        .expect("anahtar JSON'a çevrilebilir")
+    }
+
+    pub fn from_json(bytes: &[u8]) -> io::Result<Identity> {
+        let kf: KeyFile = serde_json::from_slice(bytes)?;
+        let private = from_hex(&kf.private).ok_or_else(|| invalid("bozuk anahtar dosyası"))?;
+        let public = from_hex(&kf.public).ok_or_else(|| invalid("bozuk anahtar dosyası"))?;
+        Ok(Identity { private, public })
+    }
+
     /// `dir/key.json` dosyasından okur; yoksa yeni anahtar üretip kaydeder.
     pub fn load_or_create(dir: &Path) -> io::Result<Identity> {
         let path = dir.join("key.json");
