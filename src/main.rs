@@ -14,6 +14,7 @@ mod sound;
 mod storage;
 mod update;
 mod vault;
+mod voice;
 
 use eframe::egui;
 

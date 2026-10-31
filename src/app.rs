@@ -11,6 +11,7 @@ use crate::storage::{
     Signal, ThemeChoice, TrustedPeer,
 };
 use crate::update;
+use crate::voice;
 use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
@@ -175,6 +176,14 @@ pub struct LanChatApp {
     /// Dosya Gezgini'nden "Gönder → LanChat" ile gelen, kime gideceği sorulan dosyalar
     send_choice: Option<Vec<PathBuf>>,
     groups: Vec<Group>,
+    /// Süren mikrofon kaydı (sesli mesaj)
+    recorder: Option<voice::Recorder>,
+    /// Çalınan sesli mesaj
+    player: Option<voice::Player>,
+    /// Kaydedilmekte olan sesli mesaj: (hangi sohbete, sonuç)
+    voice_saving: Option<(String, Receiver<std::io::Result<PathBuf>>)>,
+    /// Ses dosyalarının süresi (mesaj kimliğine göre; bir kez okunur)
+    audio_lengths: HashMap<String, Option<Duration>>,
     /// Açık grup oluşturma/düzenleme penceresi
     group_edit: Option<GroupEdit>,
     /// Pencereden dışarı sürüklenecek dosya (bu karenin sonunda başlatılır)
@@ -317,6 +326,10 @@ impl LanChatApp {
             paste_preview: None,
             send_choice: None,
             groups: history.groups,
+            recorder: None,
+            player: None,
+            voice_saving: None,
+            audio_lengths: HashMap::new(),
             group_edit: None,
             drag_out: None,
             release_pointer: false,
@@ -1374,6 +1387,46 @@ impl LanChatApp {
                 p.name
             )),
             Err(e) => self.show_toast(format!("Uyandırma sinyali gönderilemedi: {e}")),
+        }
+    }
+
+    /// Sesli mesaj kaydını bitirir; `send` ise seçili sohbete gönderir.
+    fn finish_recording(&mut self, send: bool) {
+        let Some(rec) = self.recorder.take() else {
+            return;
+        };
+        let (samples, rate) = rec.stop();
+        let Some(chat) = self.selected.clone().filter(|_| send) else {
+            return;
+        };
+        // Dönüştürme ve yazma arka planda: arayüz takılmasın
+        let dir = self.cfg.download_dir.join("Sesli mesajlar");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(voice::save(&samples, rate, &dir));
+        });
+        self.voice_saving = Some((chat, rx));
+    }
+
+    /// Arka planda kaydedilen sesli mesaj hazır olunca gönderir.
+    fn voice_saving_logic(&mut self) {
+        let Some((chat, rx)) = &self.voice_saving else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(_) => Err(std::io::Error::other("kaydedilemedi")),
+        };
+        let chat = chat.clone();
+        self.voice_saving = None;
+        match result {
+            Ok(path) => {
+                let prev = self.selected.replace(chat);
+                self.send_paths(vec![path]);
+                self.selected = prev;
+            }
+            Err(e) => self.show_toast(format!("Sesli mesaj kaydedilemedi: {e}")),
         }
     }
 
@@ -2926,6 +2979,52 @@ impl LanChatApp {
                 let ctx = ui.ctx().clone();
                 self.send_nudge(&ctx);
             }
+            if let Some(rec) = &self.recorder {
+                // Kayıt sürerken yazma kutusunun yerine kayıt çubuğu
+                let secs = rec.elapsed();
+                let level = rec.level();
+                ui.label(
+                    RichText::new("●")
+                        .size(18.0)
+                        .color(Color32::from_rgb(220, 38, 38)),
+                );
+                ui.label(
+                    RichText::new(format!("Kaydediliyor  {}", voice::format_len(secs)))
+                        .strong()
+                        .color(Color32::from_rgb(220, 38, 38)),
+                );
+                ui.add(
+                    egui::ProgressBar::new(level)
+                        .desired_width(120.0)
+                        .fill(Color32::from_rgb(34, 197, 94)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [90.0, 36.0],
+                            egui::Button::new(RichText::new("Gönder ➤").strong()),
+                        )
+                        .clicked()
+                        || enter_pressed
+                    {
+                        self.finish_recording(true);
+                    }
+                    if ui.button("✖ İptal").clicked() {
+                        self.finish_recording(false);
+                    }
+                });
+                return;
+            }
+            if ui
+                .button(RichText::new("🎤").size(18.0))
+                .on_hover_text("Sesli mesaj kaydet")
+                .clicked()
+            {
+                match voice::Recorder::start() {
+                    Ok(r) => self.recorder = Some(r),
+                    Err(e) => self.show_toast(e),
+                }
+            }
             let send_w = 80.0;
             let edit = TextEdit::multiline(&mut self.input)
                 .id(input_id)
@@ -3222,6 +3321,26 @@ impl LanChatApp {
 
         let mut actions: Vec<Action> = Vec::new();
         let mut wanted_thumbs: Vec<String> = Vec::new();
+        // Bu sohbetteki ses dosyalarının süresi (bir kez okunur)
+        let audio: Vec<(String, PathBuf)> = self
+            .messages
+            .iter()
+            .filter(|m| m.peer_id == peer_id && m.state == MsgState::Done)
+            .filter_map(|m| match &m.body {
+                Body::File {
+                    name,
+                    path: Some(p),
+                    is_dir: false,
+                    ..
+                } if voice::is_audio(name) && !self.audio_lengths.contains_key(&m.id) => {
+                    Some((m.id.clone(), p.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, p) in audio {
+            self.audio_lengths.insert(id, voice::wav_duration(&p));
+        }
         let names: HashMap<String, String> = self
             .peers
             .iter()
@@ -3290,7 +3409,16 @@ impl LanChatApp {
                         } else {
                             Cow::Borrowed(&m.reactions)
                         };
+                        let audio = self.audio_lengths.get(&m.id).map(|len| AudioView {
+                            len: *len,
+                            playing: self
+                                .player
+                                .as_ref()
+                                .filter(|p| p.msg_id == m.id)
+                                .map(|p| p.progress()),
+                        });
                         let ctx = BubbleCtx {
+                            audio,
                             author,
                             status,
                             thumb,
@@ -3312,6 +3440,14 @@ impl LanChatApp {
         for a in actions {
             match a {
                 Action::OpenFile(p) => open_path(&p),
+                Action::PlayAudio(id, p) => {
+                    self.player = None;
+                    match voice::Player::play(&p, &id) {
+                        Ok(pl) => self.player = Some(pl),
+                        Err(e) => self.show_toast(e),
+                    }
+                }
+                Action::StopAudio => self.player = None,
                 Action::DragOut(p) => self.drag_out = Some(p),
                 Action::Retry(id) => self.retry(&id),
                 Action::Cancel(id) => {
@@ -3710,6 +3846,8 @@ impl LanChatApp {
 
 enum Action {
     OpenFile(PathBuf),
+    PlayAudio(String, PathBuf),
+    StopAudio,
     /// Dosyayı pencereden dışarı sürükle
     DragOut(PathBuf),
     Retry(String),
@@ -3733,7 +3871,15 @@ const SHAKE_TIME: Duration = Duration::from_millis(700);
 const REACTIONS: [&str; 6] = ["👍", "❤", "😂", "😮", "😢", "🙏"];
 
 /// Balonun çizilmesi için gereken ek bilgiler
+/// Ses dosyası balonunda oynatıcı
+struct AudioView {
+    len: Option<Duration>,
+    /// Çalınıyorsa ilerleme (0..1)
+    playing: Option<f32>,
+}
+
 struct BubbleCtx<'a> {
+    audio: Option<AudioView>,
     /// Grup mesajında yazanın adı
     author: Option<String>,
     /// "Herkese" sohbetindeki özet mesajlar için toplu teslim durumu
@@ -3760,6 +3906,7 @@ fn clear_message(m: &mut ChatMessage) {
 
 fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &mut Vec<Action>) {
     let BubbleCtx {
+        audio,
         author,
         status,
         thumb,
@@ -3836,7 +3983,7 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &m
                         Body::Text(t) => {
                             ui.add(egui::Label::new(RichText::new(t).size(15.0)).wrap());
                         }
-                        Body::File { .. } => file_body(ui, m, thumb, actions),
+                        Body::File { .. } => file_body(ui, m, thumb, audio, actions),
                         Body::Nudge => {}
                     }
                     if !reactions.is_empty() && !m.deleted {
@@ -4060,6 +4207,7 @@ fn file_body(
     ui: &mut egui::Ui,
     m: &ChatMessage,
     thumb: Option<&egui::TextureHandle>,
+    audio: Option<AudioView>,
     actions: &mut Vec<Action>,
 ) {
     let Body::File {
@@ -4090,6 +4238,38 @@ fn file_body(
     }
     let scanning =
         is_dir && m.outgoing && size == 0 && *file_count == 0 && m.state == MsgState::Pending;
+
+    // Ses dosyası: oynatıcı
+    if let (Some(a), Some(p)) = (&audio, path)
+        && m.state == MsgState::Done
+    {
+        ui.horizontal(|ui| {
+            let playing = a.playing.is_some();
+            let icon = if playing { "⏹" } else { "▶" };
+            let b = ui
+                .add_sized(
+                    [36.0, 30.0],
+                    egui::Button::new(RichText::new(icon).size(16.0)),
+                )
+                .on_hover_text(if playing { "Durdur" } else { "Dinle" });
+            if b.clicked() {
+                actions.push(if playing {
+                    Action::StopAudio
+                } else {
+                    Action::PlayAudio(m.id.clone(), p.clone())
+                });
+            }
+            ui.add(
+                egui::ProgressBar::new(a.playing.unwrap_or(0.0))
+                    .desired_width(160.0)
+                    .desired_height(8.0),
+            );
+            if let Some(len) = a.len {
+                ui.label(RichText::new(voice::format_len(len)).small().weak());
+            }
+        });
+        ui.add_space(2.0);
+    }
 
     let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if is_dir { "🗂" } else { file_icon(name) }).size(26.0));
@@ -4216,6 +4396,21 @@ impl eframe::App for LanChatApp {
             let _ = self.cfg.save(&self.data_dir);
         }
         self.shake_logic(ctx);
+        if self
+            .recorder
+            .as_ref()
+            .is_some_and(|r| r.elapsed() >= voice::MAX_LEN)
+        {
+            self.finish_recording(true);
+            self.show_toast("En fazla 5 dakikalık kayıt yapılabilir; sesli mesaj gönderildi");
+        }
+        if self.player.as_ref().is_some_and(|p| p.finished()) {
+            self.player = None;
+        }
+        self.voice_saving_logic();
+        if self.recorder.is_some() || self.player.is_some() || self.voice_saving.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         self.focused = !self.hidden && ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if self.focused
             && let Some(sel) = &self.selected
