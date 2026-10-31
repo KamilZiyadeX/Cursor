@@ -5,7 +5,8 @@ use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
 use crate::protocol::{self, ReplyRef};
 use crate::secure::PublicKey;
 use crate::storage::{
-    self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Profile, TrustedPeer,
+    self, Body, ChatMessage, Config, History, KnownPeer, MsgState, Outgoing, Profile, Signal,
+    TrustedPeer,
 };
 use crate::update;
 use chrono::{Local, TimeZone};
@@ -148,6 +149,11 @@ pub struct LanChatApp {
     /// Kişi başına son gelen/giden titreşim (art arda titreşimi sınırlamak için)
     last_nudge_in: HashMap<String, Instant>,
     last_nudge_out: HashMap<String, Instant>,
+    /// Çevrimdışı kişilere iletilmeyi bekleyen bildirimler
+    outbox: Vec<Outgoing>,
+    /// Kişi başına son "sıradakileri gönder" denemesi
+    last_flush: HashMap<String, Instant>,
+    last_queue_check: Instant,
     /// Açık arama: (hangi sohbette, aranan metin)
     search: Option<(String, String)>,
     /// Arama kutusuna odaklanılsın mı (bir kerelik)
@@ -276,6 +282,9 @@ impl LanChatApp {
             shake: None,
             last_nudge_in: HashMap::new(),
             last_nudge_out: HashMap::new(),
+            outbox: history.outbox,
+            last_flush: HashMap::new(),
+            last_queue_check: Instant::now(),
             search: None,
             search_focus: false,
             thumbs: HashMap::new(),
@@ -322,6 +331,15 @@ impl LanChatApp {
 
     /// `local`: aynı bilgisayardaki başka bir hesap mı (None: bilinmiyor, değiştirme)
     fn upsert_peer(&mut self, id: &str, name: &str, addr: SocketAddr, local: Option<bool>) {
+        let was_online = self.peer(id).is_some_and(|p| p.online());
+        self.upsert_peer_inner(id, name, addr, local);
+        if !was_online {
+            // Çevrimiçi oldu: sırada bekleyenleri gönder
+            self.flush_queue(id);
+        }
+    }
+
+    fn upsert_peer_inner(&mut self, id: &str, name: &str, addr: SocketAddr, local: Option<bool>) {
         let changed = match self.peer_mut(id) {
             Some(p) => {
                 let changed = p.name != name || p.addr != Some(addr);
@@ -641,6 +659,14 @@ impl LanChatApp {
             } => {
                 self.upsert_peer(&from.id, &from.name, addr, None);
                 self.typing.remove(&from.id);
+                // Aynı mesaj ikinci kez gelirse (ör. onay ulaşmadan bağlantı koptuysa) yok say
+                if self
+                    .messages
+                    .iter()
+                    .any(|m| m.id == msg_id && m.peer_id == from.id)
+                {
+                    return;
+                }
                 let preview = text.clone();
                 self.push_message(ChatMessage {
                     reply_to,
@@ -744,9 +770,20 @@ impl LanChatApp {
                     self.dirty = true;
                 }
             }
-            NetEvent::Failed { msg_id, error } => {
+            NetEvent::Failed {
+                msg_id,
+                error,
+                unreachable,
+            } => {
                 if let Some(m) = self.message_mut(&msg_id) {
-                    m.state = MsgState::Failed(error);
+                    // Karşı bilgisayara bağlanılamadıysa (kapalıysa) sıraya döner;
+                    // çevrimiçi olunca kendiliğinden yeniden gönderilir.
+                    m.state = if unreachable && m.outgoing {
+                        MsgState::Queued
+                    } else {
+                        MsgState::Failed(error)
+                    };
+                    m.speed.reset();
                     self.dirty = true;
                 }
             }
@@ -765,6 +802,7 @@ impl LanChatApp {
                 })
                 .collect(),
             messages: self.messages.clone(),
+            outbox: self.outbox.clone(),
         }
     }
 
@@ -847,24 +885,29 @@ impl LanChatApp {
 
     /// Gönderdiğimiz mesajı iki taraftan da siler.
     fn delete_for_all(&mut self, msg_id: &str) {
-        let Some(m) = self
+        let copies = self.copies_of(msg_id);
+        let mut ids: Vec<&str> = copies.iter().map(|(_, id)| id.as_str()).collect();
+        ids.push(msg_id);
+        for m in self
             .messages
             .iter_mut()
-            .find(|m| m.id == msg_id && m.outgoing)
-        else {
-            return;
-        };
-        clear_message(m);
-        let peer_id = m.peer_id.clone();
+            .filter(|m| ids.contains(&m.id.as_str()) && m.outgoing)
+        {
+            clear_message(m);
+        }
         self.dirty = true;
-        let addr = self.peer(&peer_id).and_then(|p| p.addr);
-        if let (Some(net), Some(addr), true) = (&self.net, addr, self.is_paired(&peer_id)) {
-            net.send_delete(addr, peer_id, msg_id.to_string());
-            self.show_toast("Mesaj iki taraftan da silindi");
-        } else {
+        let mut offline = 0;
+        for (peer, id) in copies {
+            if !self.send_signal(&peer, Signal::Delete { msg_id: id }) {
+                offline += 1;
+            }
+        }
+        if offline > 0 {
             self.show_toast(
-                "Mesaj sizden silindi; karşı taraf çevrimiçi olmadığı için onda kalabilir",
+                "Mesaj sizden silindi; karşı taraf çevrimiçi olunca ondan da silinecek",
             );
+        } else {
+            self.show_toast("Mesaj iki taraftan da silindi");
         }
     }
 
@@ -885,22 +928,108 @@ impl LanChatApp {
         }
     }
 
-    /// Kişiye kısa bir bildirim (düzeltme, tepki…) gönderir. Kişi çevrimdışıysa `false`.
-    fn send_signal(&self, peer_id: &str, signal: Signal) -> bool {
+    /// Kişiye kısa bir bildirim (düzeltme, tepki…) gönderir. Kişi çevrimdışıysa
+    /// bildirim sıraya konur (titreşim hariç) ve `false` döner.
+    fn send_signal(&mut self, peer_id: &str, signal: Signal) -> bool {
         let addr = self
             .peer(peer_id)
             .filter(|p| p.online())
             .and_then(|p| p.addr);
         let (Some(net), Some(addr), true) = (&self.net, addr, self.is_paired(peer_id)) else {
+            History::queue_signal(&mut self.outbox, peer_id, signal);
+            self.dirty = true;
             return false;
         };
         let peer = peer_id.to_string();
         match signal {
+            Signal::Delete { msg_id } => net.send_delete(addr, peer, msg_id),
             Signal::Edit { msg_id, text } => net.send_edit(addr, peer, msg_id, text),
             Signal::React { msg_id, emoji } => net.send_react(addr, peer, msg_id, emoji),
             Signal::Nudge => net.send_nudge(addr, peer),
         }
         true
+    }
+
+    /// Kişi çevrimiçiyse sırada bekleyen mesajlarını ve bildirimlerini gönderir.
+    fn flush_queue(&mut self, peer_id: &str) {
+        if !self.peer(peer_id).is_some_and(|p| p.online()) || !self.is_paired(peer_id) {
+            return;
+        }
+        self.last_flush.insert(peer_id.to_string(), Instant::now());
+        let queued: Vec<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.peer_id == peer_id && m.outgoing && m.state == MsgState::Queued)
+            .map(|m| m.id.clone())
+            .collect();
+        for id in queued {
+            self.dispatch(&id);
+        }
+        let (mine, rest): (Vec<Outgoing>, Vec<Outgoing>) = std::mem::take(&mut self.outbox)
+            .into_iter()
+            .partition(|o| o.peer_id == peer_id);
+        self.outbox = rest;
+        if !mine.is_empty() {
+            self.dirty = true;
+        }
+        for o in mine {
+            self.send_signal(&o.peer_id, o.signal);
+        }
+    }
+
+    /// Bağlanılamayan ama listede çevrimiçi görünen kişiler için arada bir yeniden dener.
+    fn retry_queues(&mut self) {
+        let due: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|p| p.online())
+            .filter(|p| {
+                self.last_flush
+                    .get(&p.id)
+                    .is_none_or(|t| t.elapsed() > QUEUE_RETRY)
+            })
+            .filter(|p| {
+                self.outbox.iter().any(|o| o.peer_id == p.id)
+                    || self
+                        .messages
+                        .iter()
+                        .any(|m| m.peer_id == p.id && m.state == MsgState::Queued)
+            })
+            .map(|p| p.id.clone())
+            .collect();
+        for id in due {
+            self.flush_queue(&id);
+        }
+    }
+
+    /// Giden mesajı gönderir; kişi çevrimdışıysa sıraya koyar.
+    fn dispatch(&mut self, msg_id: &str) {
+        let Some(m) = self.messages.iter().find(|m| m.id == msg_id).cloned() else {
+            return;
+        };
+        let addr = self
+            .peer(&m.peer_id)
+            .filter(|p| p.online())
+            .and_then(|p| p.addr);
+        let (Some(net), Some(addr)) = (self.net.clone(), addr) else {
+            if let Some(mm) = self.message_mut(msg_id) {
+                mm.state = MsgState::Queued;
+                mm.speed.reset();
+            }
+            self.dirty = true;
+            return;
+        };
+        if let Some(mm) = self.message_mut(msg_id) {
+            mm.state = MsgState::Pending;
+            mm.progress = 0;
+            mm.note = None;
+            mm.speed.reset();
+        }
+        match m.body {
+            Body::Text(t) => net.send_reply(addr, m.peer_id, m.id, t, m.reply_to),
+            Body::File { path: Some(p), .. } => net.send_path(addr, m.peer_id, m.id, p),
+            Body::File { path: None, .. } | Body::Nudge => {}
+        }
     }
 
     /// Mesaja tepki verir; aynı tepki seçiliyse kaldırır.
@@ -936,7 +1065,7 @@ impl LanChatApp {
             }
         }
         if offline > 0 {
-            self.show_toast("Karşı taraf çevrimdışı; tepkiniz ona iletilemedi");
+            self.show_toast("Karşı taraf çevrimdışı; tepkiniz çevrimiçi olunca iletilecek");
         }
     }
 
@@ -1050,7 +1179,9 @@ impl LanChatApp {
             }
         }
         if offline > 0 {
-            self.show_toast("Mesaj sizde düzeltildi; karşı taraf çevrimdışı olduğu için onda eski hâli kalabilir");
+            self.show_toast(
+                "Mesaj sizde düzeltildi; karşı taraf çevrimiçi olunca onda da düzelecek",
+            );
         }
     }
 
@@ -1162,7 +1293,8 @@ impl LanChatApp {
 
     /* ------------------------------ Gönderme ------------------------------ */
 
-    fn target_addr(&mut self) -> Option<(String, SocketAddr)> {
+    /// Seçili sohbetin kişisi (eşleşmiş olmalı; çevrimdışıysa mesajlar sıraya girer).
+    fn target_peer(&mut self) -> Option<String> {
         let Some(peer_id) = self.selected.clone() else {
             self.show_toast("Önce soldan bir kişi seçin");
             return None;
@@ -1171,21 +1303,16 @@ impl LanChatApp {
             self.show_toast("Önce bu kişiyle eşleşmelisiniz: üstteki “🔑 Eşleştir”e basın");
             return None;
         }
-        match self.peer(&peer_id).and_then(|p| p.addr) {
-            Some(addr) => Some((peer_id, addr)),
-            None => {
-                self.show_toast("Bu kişinin adresi bilinmiyor");
-                None
-            }
-        }
+        Some(peer_id)
     }
 
-    /// "Herkese" gönderiminde alıcılar: çevrimiçi ve eşleşmiş herkes.
-    fn broadcast_targets(&self) -> Vec<(String, String, SocketAddr)> {
+    /// "Herkese" gönderiminde alıcılar: eşleşmiş herkes (kimlik, ad, çevrimiçi mi).
+    /// Çevrimdışı olanlara giden kopyalar sıraya girer.
+    fn broadcast_targets(&self) -> Vec<(String, String, bool)> {
         self.peers
             .iter()
-            .filter(|p| p.online() && (p.local || self.cfg.is_trusted(&p.id)))
-            .filter_map(|p| Some((p.id.clone(), p.name.clone(), p.addr?)))
+            .filter(|p| p.local || self.cfg.is_trusted(&p.id))
+            .map(|p| (p.id.clone(), p.name.clone(), p.online()))
             .collect()
     }
 
@@ -1217,11 +1344,14 @@ impl LanChatApp {
             .iter()
             .filter(|k| matches!(k.state, MsgState::Failed(_)))
             .count();
+        let queued = kids.iter().filter(|k| k.state == MsgState::Queued).count();
         let read = kids.iter().filter(|k| k.read).count();
         if failed > 0 {
             format!(
                 "{done}/{total} teslim edildi · {failed} başarısız (kişinin sohbetinden tekrar deneyin)"
             )
+        } else if queued > 0 {
+            format!("{done}/{total} teslim edildi · 🕓 {queued} kişi çevrimiçi olunca gidecek")
         } else if done < total {
             format!("gönderiliyor… {done}/{total}")
         } else if read == total {
@@ -1243,24 +1373,23 @@ impl LanChatApp {
             self.input.clear();
             return;
         }
-        let Some(net) = self.net.clone() else { return };
         if self.selected.as_deref() == Some(BROADCAST) {
             let targets = self.broadcast_targets();
             if targets.is_empty() {
-                self.show_toast("Şu an çevrimiçi eşleşmiş cihaz yok");
+                self.show_toast("Henüz eşleşmiş cihaz yok");
                 return;
             }
             let mut children = Vec::new();
-            for (peer_id, _, addr) in targets {
+            for (peer_id, _, _) in targets {
                 let id = new_id();
                 self.push_message(ChatMessage::new(
                     id.clone(),
-                    peer_id.clone(),
+                    peer_id,
                     true,
                     Body::Text(text.clone()),
-                    MsgState::Pending,
+                    MsgState::Queued,
                 ));
-                net.send_reply(addr, peer_id, id.clone(), text.clone(), None);
+                self.dispatch(&id);
                 children.push(id);
             }
             self.push_message(ChatMessage {
@@ -1276,7 +1405,7 @@ impl LanChatApp {
             self.input.clear();
             return;
         }
-        let Some((peer_id, addr)) = self.target_addr() else {
+        let Some(peer_id) = self.target_peer() else {
             return;
         };
         let id = new_id();
@@ -1285,36 +1414,35 @@ impl LanChatApp {
             _ => None,
         };
         self.push_message(ChatMessage {
-            reply_to: reply_to.clone(),
+            reply_to,
             ..ChatMessage::new(
                 id.clone(),
-                peer_id.clone(),
+                peer_id,
                 true,
-                Body::Text(text.clone()),
-                MsgState::Pending,
+                Body::Text(text),
+                MsgState::Queued,
             )
         });
-        net.send_reply(addr, peer_id, id, text, reply_to);
+        self.dispatch(&id);
         self.input.clear();
     }
 
     /// Dosyaları ve/veya klasörleri gönderir.
     fn send_paths(&mut self, paths: Vec<PathBuf>) {
-        let Some(net) = self.net.clone() else { return };
         let broadcast = self.selected.as_deref() == Some(BROADCAST);
-        let targets: Vec<(String, SocketAddr)> = if broadcast {
+        let targets: Vec<String> = if broadcast {
             let t: Vec<_> = self
                 .broadcast_targets()
                 .into_iter()
-                .map(|(id, _, addr)| (id, addr))
+                .map(|(id, _, _)| id)
                 .collect();
             if t.is_empty() {
-                self.show_toast("Şu an çevrimiçi eşleşmiş cihaz yok");
+                self.show_toast("Henüz eşleşmiş cihaz yok");
                 return;
             }
             t
         } else {
-            match self.target_addr() {
+            match self.target_peer() {
                 Some(t) => vec![t],
                 None => return,
             }
@@ -1338,16 +1466,16 @@ impl LanChatApp {
                 file_count: if is_dir { 0 } else { 1 },
             };
             let mut children = Vec::new();
-            for (peer_id, addr) in &targets {
+            for peer_id in &targets {
                 let id = new_id();
                 self.push_message(ChatMessage::new(
                     id.clone(),
                     peer_id.clone(),
                     true,
                     body.clone(),
-                    MsgState::Pending,
+                    MsgState::Queued,
                 ));
-                net.send_path(*addr, peer_id.clone(), id.clone(), path.clone());
+                self.dispatch(&id);
                 children.push(id);
             }
             if broadcast {
@@ -1361,25 +1489,7 @@ impl LanChatApp {
 
     /// Başarısız mesajı yeniden gönderir; dosya/klasörde kaldığı yerden devam eder.
     fn retry(&mut self, msg_id: &str) {
-        let Some(net) = self.net.clone() else { return };
-        let Some(m) = self.messages.iter().find(|m| m.id == msg_id).cloned() else {
-            return;
-        };
-        let Some(addr) = self.peer(&m.peer_id).and_then(|p| p.addr) else {
-            self.show_toast("Bu kişinin adresi bilinmiyor");
-            return;
-        };
-        if let Some(mm) = self.message_mut(msg_id) {
-            mm.state = MsgState::Pending;
-            mm.progress = 0;
-            mm.note = None;
-            mm.speed.reset();
-        }
-        match m.body {
-            Body::Text(t) => net.send_reply(addr, m.peer_id, m.id, t, m.reply_to),
-            Body::File { path: Some(p), .. } => net.send_path(addr, m.peer_id, m.id, p),
-            Body::File { path: None, .. } | Body::Nudge => {}
-        }
+        self.dispatch(msg_id);
     }
 
     /* ------------------------------ Çizim ------------------------------ */
@@ -1821,7 +1931,7 @@ impl LanChatApp {
                         egui::Button::selectable(selected, RichText::new("📢 Herkese").size(15.0)),
                     )
                     .on_hover_text(format!(
-                        "Mesaj ve dosyaları çevrimiçi tüm eşleşmiş cihazlara gönder (şu an {n} kişi)"
+                        "Mesaj ve dosyaları eşleşmiş tüm cihazlara gönder ({n} kişi; çevrimdışı olanlara açılınca gider)"
                     ));
                 if resp.clicked() {
                     self.selected = Some(BROADCAST.to_string());
@@ -2053,7 +2163,7 @@ impl LanChatApp {
             Vec::new()
         };
         let (name, online) = if is_broadcast {
-            ("📢 Herkese".to_string(), !targets.is_empty())
+            ("📢 Herkese".to_string(), targets.iter().any(|t| t.2))
         } else {
             self.peer(&peer_id)
                 .map(|p| (p.name.clone(), p.online()))
@@ -2095,10 +2205,17 @@ impl LanChatApp {
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 if is_broadcast {
                     let names: Vec<&str> = targets.iter().map(|(_, n, _)| n.as_str()).collect();
+                    let on = targets.iter().filter(|t| t.2).count();
                     let text = if names.is_empty() {
-                        "şu an çevrimiçi eşleşmiş cihaz yok".to_string()
+                        "henüz eşleşmiş cihaz yok".to_string()
+                    } else if on == names.len() {
+                        format!("{} kişiye gider", names.len())
                     } else {
-                        format!("{} çevrimiçi kişiye gider", names.len())
+                        format!(
+                            "{} kişiye gider ({} çevrimdışı: açılınca alacak)",
+                            names.len(),
+                            names.len() - on
+                        )
                     };
                     ui.label(RichText::new(text).small().weak())
                         .on_hover_text(names.join(", "));
@@ -2701,6 +2818,8 @@ enum Action {
     React(String, &'static str),
 }
 
+/// Çevrimiçi görünüp bağlanılamayan kişiye sıradakileri yeniden deneme aralığı
+const QUEUE_RETRY: Duration = Duration::from_secs(30);
 /// Aynı kişiye art arda titreşim gönderilemeyecek süre
 const NUDGE_COOLDOWN: Duration = Duration::from_secs(10);
 /// Pencerenin sallanma süresi
@@ -2708,19 +2827,6 @@ const SHAKE_TIME: Duration = Duration::from_millis(700);
 
 /// Mesaja verilebilecek tepkiler
 const REACTIONS: [&str; 6] = ["👍", "❤", "😂", "😮", "😢", "🙏"];
-
-/// Kişiye gönderilen kısa bildirimler
-enum Signal {
-    Edit {
-        msg_id: String,
-        text: String,
-    },
-    React {
-        msg_id: String,
-        emoji: Option<String>,
-    },
-    Nudge,
-}
 
 /// Balonun çizilmesi için gereken ek bilgiler
 struct BubbleCtx<'a> {
@@ -2830,6 +2936,16 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, bc: BubbleCtx, actions: &m
                             ui.label(RichText::new(st).small().color(col));
                         } else if m.outgoing {
                             match &m.state {
+                                MsgState::Queued => {
+                                    ui.label(
+                                        RichText::new("🕓 sırada")
+                                            .small()
+                                            .color(Color32::from_rgb(234, 179, 8)),
+                                    )
+                                    .on_hover_text(
+                                        "Kişi şu an çevrimdışı. Çevrimiçi olunca kendiliğinden gönderilecek.",
+                                    );
+                                }
                                 MsgState::Pending => {
                                     if matches!(m.body, Body::Text(_)) {
                                         ui.label(RichText::new("gönderiliyor…").small().weak());
@@ -3075,6 +3191,13 @@ fn file_body(
     });
 
     match &m.state {
+        MsgState::Queued => {
+            ui.label(
+                RichText::new("Kişi çevrimiçi olunca gönderilecek")
+                    .small()
+                    .weak(),
+            );
+        }
         MsgState::Pending => {
             let frac = if size == 0 {
                 if scanning { 0.0 } else { 1.0 }
@@ -3177,6 +3300,10 @@ impl eframe::App for LanChatApp {
         }
 
         self.send_read_receipts();
+        if self.last_queue_check.elapsed() > Duration::from_secs(2) {
+            self.last_queue_check = Instant::now();
+            self.retry_queues();
+        }
         self.receive_thumbs(ctx);
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             self.save_history();

@@ -152,6 +152,9 @@ pub enum NetEvent {
     Failed {
         msg_id: String,
         error: String,
+        /// Karşı bilgisayara hiç bağlanılamadı (kapalı ya da ağda değil):
+        /// gönderim, kişi çevrimiçi olunca yeniden denenebilir.
+        unreachable: bool,
     },
 }
 
@@ -855,6 +858,7 @@ impl Net {
                         self.emit(NetEvent::Failed {
                             msg_id,
                             error: friendly_error(&e, Side::Receiver),
+                            unreachable: false,
                         });
                     }
                 }
@@ -1237,6 +1241,7 @@ impl Net {
                 Err(e) => NetEvent::Failed {
                     msg_id,
                     error: friendly_error(&e, Side::Sender),
+                    unreachable: is_unreachable(&e),
                 },
             });
         });
@@ -1259,6 +1264,7 @@ impl Net {
                 Err(e) => NetEvent::Failed {
                     msg_id,
                     error: friendly_error(&e, Side::Sender),
+                    unreachable: is_unreachable(&e),
                 },
             });
         });
@@ -1566,8 +1572,26 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(secure::to_hex(&h.finalize()))
 }
 
+/// Karşı bilgisayara TCP bağlantısı kurulamadığını belirten hata.
+#[derive(Debug)]
+struct Unreachable(io::Error);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// Hata, karşı bilgisayara hiç bağlanılamamasından mı kaynaklanıyor?
+fn is_unreachable(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Unreachable>())
+}
+
 fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|e| io::Error::new(e.kind(), Unreachable(e)))?;
     s.set_read_timeout(Some(IO_TIMEOUT))?;
     s.set_write_timeout(Some(IO_TIMEOUT))?;
     s.set_nodelay(true)?;
@@ -1747,7 +1771,7 @@ mod tests {
     fn completed(rx: &Receiver<NetEvent>, id: &str) -> NetEvent {
         wait_for(rx, |e| match e {
             NetEvent::Completed { msg_id, .. } => msg_id == id,
-            NetEvent::Failed { msg_id, error } if msg_id == id => panic!("başarısız: {error}"),
+            NetEvent::Failed { msg_id, error, .. } if msg_id == id => panic!("başarısız: {error}"),
             _ => false,
         })
     }
@@ -2128,6 +2152,41 @@ mod tests {
                 | NetEvent::Reacted { .. }
                 | NetEvent::Nudged { .. }
         )));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn unreachable_peer_is_reported_as_such() {
+        let d = temp_dir("ulasilamaz");
+        let (a, rx_a) = start("A", &d);
+        let (b, _rx_b) = start("B", &d);
+        pair_up(&a, "A", &b, "B");
+        // Kimsenin dinlemediği bir port: bağlantı reddedilir
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let dead: SocketAddr = ([127, 0, 0, 1], port).into();
+        a.send_text(dead, "B".into(), "m1".into(), "merhaba".into());
+        let NetEvent::Failed { unreachable, .. } =
+            wait_for(&rx_a, |e| matches!(e, NetEvent::Failed { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(
+            unreachable,
+            "bağlanılamayan karşı taraf 'ulaşılamaz' sayılmalı"
+        );
+
+        // Bağlanılıp başka bir nedenle başarısız olan gönderim ulaşılamaz sayılmaz
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+        a.send_path(addr_b, "B".into(), "f1".into(), d.join("olmayan-dosya"));
+        let NetEvent::Failed { unreachable, .. } = wait_for(
+            &rx_a,
+            |e| matches!(e, NetEvent::Failed { msg_id, .. } if msg_id == "f1"),
+        ) else {
+            unreachable!()
+        };
+        assert!(!unreachable);
         fs::remove_dir_all(d).unwrap();
     }
 

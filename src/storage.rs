@@ -86,6 +86,8 @@ pub enum Body {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MsgState {
+    /// Kişi çevrimdışı: çevrimiçi olunca kendiliğinden gönderilecek
+    Queued,
     Pending,
     Done,
     Failed(String),
@@ -197,6 +199,68 @@ pub struct KnownPeer {
 pub struct History {
     pub peers: Vec<KnownPeer>,
     pub messages: Vec<ChatMessage>,
+    /// Çevrimdışı kişilere iletilmeyi bekleyen bildirimler (düzeltme, tepki, silme)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbox: Vec<Outgoing>,
+}
+
+/// Bir kişiye gönderilecek kısa bildirim
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Signal {
+    Delete {
+        msg_id: String,
+    },
+    Edit {
+        msg_id: String,
+        text: String,
+    },
+    React {
+        msg_id: String,
+        emoji: Option<String>,
+    },
+    /// Titreşim (sıraya konmaz: geç gelen titreşimin anlamı yok)
+    Nudge,
+}
+
+impl Signal {
+    /// Bildirimin ilgili olduğu mesaj
+    pub fn msg_id(&self) -> Option<&str> {
+        match self {
+            Signal::Delete { msg_id }
+            | Signal::Edit { msg_id, .. }
+            | Signal::React { msg_id, .. } => Some(msg_id),
+            Signal::Nudge => None,
+        }
+    }
+}
+
+/// Sırada bekleyen bildirim
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Outgoing {
+    pub peer_id: String,
+    pub signal: Signal,
+}
+
+impl History {
+    /// Bildirimi sıraya koyar. Aynı mesaj için bekleyen eski bildirimin yerini alır
+    /// (son düzeltme/tepki yeterli); silme, o mesajla ilgili her şeyin yerini alır.
+    pub fn queue_signal(outbox: &mut Vec<Outgoing>, peer_id: &str, signal: Signal) {
+        if matches!(signal, Signal::Nudge) {
+            return;
+        }
+        let id = signal.msg_id().map(str::to_owned);
+        let deleting = matches!(signal, Signal::Delete { .. });
+        outbox.retain(|o| {
+            if o.peer_id != peer_id || o.signal.msg_id() != id.as_deref() {
+                return true;
+            }
+            !(deleting || std::mem::discriminant(&o.signal) == std::mem::discriminant(&signal))
+        });
+        outbox.push(Outgoing {
+            peer_id: peer_id.to_string(),
+            signal,
+        });
+    }
 }
 
 /// Bu Windows kullanıcısının LanChat kök veri klasörü (tüm hesaplar burada).
@@ -631,14 +695,18 @@ impl History {
 
     fn from_bytes(bytes: &[u8]) -> History {
         let mut h: History = serde_json::from_slice(bytes).unwrap_or_default();
-        // Uygulama kapanırken yarım kalan aktarımlar
+        // Uygulama kapanırken yarım kalan gönderimler: kişi çevrimiçi olunca
+        // kendiliğinden kaldığı yerden sürer. Gelenler gönderenin devam etmesini bekler.
         for m in &mut h.messages {
             if m.state == MsgState::Pending {
-                m.state = MsgState::Failed(if m.outgoing {
-                    "Aktarım yarıda kaldı".into()
+                m.state = if m.outgoing {
+                    MsgState::Queued
                 } else {
-                    "Aktarım yarıda kaldı; gönderen “Devam et” derse kaldığı yerden sürer".into()
-                });
+                    MsgState::Failed(
+                        "Aktarım yarıda kaldı; gönderen devam ettirince kaldığı yerden sürer"
+                            .into(),
+                    )
+                };
             }
         }
         h
@@ -684,6 +752,35 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn queued_signals_are_coalesced() {
+        let mut out = Vec::new();
+        let react = |e: &str| Signal::React {
+            msg_id: "m".into(),
+            emoji: Some(e.into()),
+        };
+        History::queue_signal(&mut out, "p", react("👍"));
+        History::queue_signal(&mut out, "p", react("❤"));
+        History::queue_signal(&mut out, "q", react("👍"));
+        History::queue_signal(
+            &mut out,
+            "p",
+            Signal::Edit {
+                msg_id: "m".into(),
+                text: "a".into(),
+            },
+        );
+        History::queue_signal(&mut out, "p", Signal::Nudge);
+        // Aynı kişi ve mesaj için yalnızca son tepki kalır; titreşim sıraya girmez
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].signal, react("❤"));
+        // Silme, o mesajla ilgili bekleyen her şeyin yerini alır
+        History::queue_signal(&mut out, "p", Signal::Delete { msg_id: "m".into() });
+        let for_p: Vec<_> = out.iter().filter(|o| o.peer_id == "p").collect();
+        assert_eq!(for_p.len(), 1);
+        assert_eq!(for_p[0].signal, Signal::Delete { msg_id: "m".into() });
+    }
+
     fn sample_history(text: &str) -> History {
         History {
             peers: vec![],
@@ -694,6 +791,7 @@ mod tests {
                 Body::Text(text.into()),
                 MsgState::Done,
             )],
+            outbox: vec![],
         }
     }
 
@@ -806,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn history_roundtrip_marks_pending_failed() {
+    fn history_roundtrip_requeues_outgoing_and_fails_incoming() {
         let dir = std::env::temp_dir().join(format!("lanchat-hist-{}", uuid::Uuid::new_v4()));
         let h = History {
             peers: vec![KnownPeer {
@@ -814,28 +912,44 @@ mod tests {
                 name: "Ofis".into(),
                 addr: Some("192.168.1.5:47821".parse().unwrap()),
             }],
-            messages: vec![ChatMessage {
-                progress: 5,
-                ..ChatMessage::new(
-                    "1".into(),
+            messages: vec![
+                ChatMessage {
+                    progress: 5,
+                    ..ChatMessage::new(
+                        "1".into(),
+                        "p".into(),
+                        true,
+                        Body::File {
+                            name: "a.zip".into(),
+                            size: 10,
+                            path: None,
+                            is_dir: false,
+                            file_count: 1,
+                        },
+                        MsgState::Pending,
+                    )
+                },
+                ChatMessage::new(
+                    "2".into(),
                     "p".into(),
-                    true,
-                    Body::File {
-                        name: "a.zip".into(),
-                        size: 10,
-                        path: None,
-                        is_dir: false,
-                        file_count: 1,
-                    },
+                    false,
+                    Body::Text(String::new()),
                     MsgState::Pending,
-                )
+                ),
+            ],
+            outbox: vec![Outgoing {
+                peer_id: "p".into(),
+                signal: Signal::Delete { msg_id: "9".into() },
             }],
         };
         h.save(&dir).unwrap();
         let loaded = History::load(&dir);
         assert_eq!(loaded.peers[0].name, "Ofis");
-        assert!(matches!(loaded.messages[0].state, MsgState::Failed(_)));
+        // Bizim yarım kalan gönderimimiz sıraya döner, gelen yarım aktarım başarısız sayılır
+        assert_eq!(loaded.messages[0].state, MsgState::Queued);
+        assert!(matches!(loaded.messages[1].state, MsgState::Failed(_)));
         assert_eq!(loaded.messages[0].progress, 0);
+        assert_eq!(loaded.outbox, h.outbox);
         fs::remove_dir_all(dir).unwrap();
     }
 }
