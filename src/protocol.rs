@@ -1,21 +1,35 @@
 //! Ağ protokolü.
 //!
 //! * Keşif: Her uygulama birkaç saniyede bir UDP ile `Beacon` yayınlar.
-//! * Aktarım: Her mesaj / dosya için yeni bir TCP bağlantısı açılır:
-//!   `"LCH1"` + u32 (big-endian) başlık uzunluğu + JSON başlık [+ dosya baytları].
-//!   Alıcı her şeyi aldıktan sonra tek bir onay baytı döndürür.
+//! * Aktarım: Her mesaj / aktarım için yeni bir TCP bağlantısı açılır.
+//!   Bağlantı `"LCH2"` ile başlar, ardından uzunluk önekli JSON çerçeveler gelir
+//!   (u32 big-endian uzunluk + JSON).
+//!
+//! Metin:
+//!   gönderen → `Packet::Text`,  alıcı → 1 bayt onay
+//!
+//! Dosya / klasör (kaldığı yerden devam edebilir):
+//!   gönderen → `Packet::Transfer`
+//!   alıcı    → `Accept` (boş alan yetmiyorsa reddeder)
+//!   her öğe için:
+//!     gönderen → `Entry::Dir` | `Entry::File`
+//!     (yalnızca dosyada) alıcı → u64: zaten elinde olan bayt sayısı (devam noktası)
+//!     (yalnızca dosyada) gönderen → kalan baytlar
+//!   gönderen → `Entry::End`,  alıcı → 1 bayt onay
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read, Write};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const DISCOVERY_PORT: u16 = 47820;
 pub const DEFAULT_TCP_PORT: u16 = 47821;
 pub const APP_TAG: &str = "lanchat";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
-const MAGIC: &[u8; 4] = b"LCH1";
-const MAX_HEADER_LEN: u32 = 4 * 1024 * 1024;
+const MAGIC: &[u8; 4] = b"LCH2";
+const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
+const COPY_BUF: usize = 1024 * 1024;
 
 pub const ACK_OK: u8 = 0;
 pub const ACK_ERR: u8 = 1;
@@ -64,19 +78,67 @@ pub enum Packet {
         msg_id: String,
         text: String,
     },
-    File {
+    /// Tek dosya (`is_dir == false`) ya da klasör aktarımı.
+    Transfer {
         from: From,
         msg_id: String,
+        /// Dosyanın ya da klasörün adı
         name: String,
-        size: u64,
+        is_dir: bool,
+        total_size: u64,
+        file_count: u64,
     },
 }
 
+/// Alıcının `Packet::Transfer`'a yanıtı.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Accept {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Aktarımdaki bir öğe. `path`, klasörün köküne göre `/` ile ayrılmış yoldur.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum Entry {
+    Dir {
+        path: String,
+    },
+    File {
+        path: String,
+        size: u64,
+        /// Değiştirilme zamanı (Unix saniyesi); alıcı dosyaya aynen uygular.
+        mtime: Option<i64>,
+    },
+    End,
+}
+
+pub fn write_frame<T: Serialize>(w: &mut impl Write, value: &T) -> io::Result<()> {
+    let json = serde_json::to_vec(value)?;
+    let mut buf = Vec::with_capacity(json.len() + 4);
+    buf.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&json);
+    w.write_all(&buf)
+}
+
+pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len);
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "çerçeve çok büyük",
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf)?;
+    Ok(serde_json::from_slice(&buf)?)
+}
+
 pub fn write_header(w: &mut impl Write, p: &Packet) -> io::Result<()> {
-    let json = serde_json::to_vec(p)?;
     w.write_all(MAGIC)?;
-    w.write_all(&(json.len() as u32).to_be_bytes())?;
-    w.write_all(&json)
+    write_frame(w, p)
 }
 
 pub fn read_header(r: &mut impl Read) -> io::Result<Packet> {
@@ -85,52 +147,58 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Packet> {
     if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "geçersiz protokol",
+            "geçersiz protokol (karşı taraftaki LanChat sürümü farklı olabilir)",
         ));
     }
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len)?;
-    let len = u32::from_be_bytes(len);
-    if len > MAX_HEADER_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "başlık çok büyük",
-        ));
-    }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf)?;
-    Ok(serde_json::from_slice(&buf)?)
+    read_frame(r)
 }
 
-/// Tam olarak `size` bayt kopyalar ve en fazla ~10 kez/sn ilerleme bildirir.
+pub fn write_u64(w: &mut impl Write, v: u64) -> io::Result<()> {
+    w.write_all(&v.to_be_bytes())
+}
+
+pub fn read_u64(r: &mut impl Read) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
+pub fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "İptal edildi")
+}
+
+/// Tam olarak `size` bayt kopyalar. Her parçadan sonra o ana kadar kopyalanan
+/// bayt sayısıyla `on_chunk` çağrılır; `cancel` işaretlenirse durur.
 pub fn copy_exact(
     r: &mut impl Read,
     w: &mut impl Write,
     size: u64,
-    mut on_progress: impl FnMut(u64),
+    cancel: &AtomicBool,
+    mut on_chunk: impl FnMut(u64),
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; COPY_BUF.min(size.max(1) as usize)];
     let mut done = 0u64;
-    let mut last = Instant::now();
     while done < size {
-        let want = (size - done).min(buf.len() as u64) as usize;
-        let n = r.read(&mut buf[..want])?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "bağlantı yarıda kesildi",
-            ));
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled_error());
         }
+        let want = (size - done).min(buf.len() as u64) as usize;
+        let n = match r.read(&mut buf[..want]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bağlantı yarıda kesildi",
+                ));
+            }
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         w.write_all(&buf[..n])?;
         done += n as u64;
-        if last.elapsed() >= Duration::from_millis(100) {
-            on_progress(done);
-            last = Instant::now();
-        }
+        on_chunk(done);
     }
-    w.flush()?;
-    on_progress(done);
-    Ok(())
+    w.flush()
 }
 
 /// Ağdan gelen dosya adını güvenli bir dosya adına çevirir (klasör kısmı atılır).
@@ -163,30 +231,55 @@ pub fn sanitize_file_name(name: &str) -> String {
     out
 }
 
+/// Aktarımdaki göreli yolu güvenli bir göreli yola çevirir.
+/// `..` içeren ya da boş yollar reddedilir; böylece gönderen,
+/// hedef klasörün dışına yazamaz.
+pub fn safe_relative_path(path: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            p => out.push(sanitize_file_name(p)),
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn from() -> From {
+        From {
+            id: "a".into(),
+            name: "Kamil – Ofis".into(),
+            port: 1,
+        }
+    }
+
     #[test]
     fn header_roundtrip() {
-        let p = Packet::File {
-            from: From {
-                id: "a".into(),
-                name: "Kamil – Ofis".into(),
-                port: 1,
-            },
+        let p = Packet::Transfer {
+            from: from(),
             msg_id: "m1".into(),
-            name: "rapor ğüş.pdf".into(),
-            size: 42,
+            name: "Fotoğraflar".into(),
+            is_dir: true,
+            total_size: 1 << 40,
+            file_count: 12345,
         };
         let mut buf = Vec::new();
         write_header(&mut buf, &p).unwrap();
-        assert_eq!(read_header(&mut buf.as_slice()).unwrap(), p);
+        write_frame(&mut buf, &Entry::End).unwrap();
+        let mut r = buf.as_slice();
+        assert_eq!(read_header(&mut r).unwrap(), p);
+        assert_eq!(read_frame::<Entry>(&mut r).unwrap(), Entry::End);
     }
 
     #[test]
     fn rejects_garbage() {
         assert!(read_header(&mut &b"HTTP/1.1 200"[..]).is_err());
+        assert!(read_header(&mut &b"LCH1\x00\x00\x00\x02{}"[..]).is_err());
         assert!(
             Beacon::parse(b"{\"app\":\"other\",\"v\":1,\"id\":\"x\",\"name\":\"n\",\"port\":1}")
                 .is_none()
@@ -203,11 +296,29 @@ mod tests {
     }
 
     #[test]
-    fn copy_exact_detects_eof() {
+    fn relative_paths_cannot_escape() {
+        assert_eq!(safe_relative_path("../x"), None);
+        assert_eq!(safe_relative_path("a/../../b"), None);
+        assert_eq!(safe_relative_path("a\\..\\b"), None);
+        assert_eq!(safe_relative_path(""), None);
+        assert_eq!(safe_relative_path("/"), None);
+        assert_eq!(
+            safe_relative_path("/a//b/./c:d.txt"),
+            Some(PathBuf::from("a").join("b").join("c_d.txt"))
+        );
+    }
+
+    #[test]
+    fn copy_exact_detects_eof_and_cancel() {
+        let no = AtomicBool::new(false);
         let mut out = Vec::new();
-        assert!(copy_exact(&mut &b"abc"[..], &mut out, 5, |_| {}).is_err());
+        assert!(copy_exact(&mut &b"abc"[..], &mut out, 5, &no, |_| {}).is_err());
         let mut out = Vec::new();
-        copy_exact(&mut &b"abcdef"[..], &mut out, 4, |_| {}).unwrap();
+        copy_exact(&mut &b"abcdef"[..], &mut out, 4, &no, |_| {}).unwrap();
         assert_eq!(out, b"abcd");
+
+        let yes = AtomicBool::new(true);
+        let err = copy_exact(&mut &b"abcdef"[..], &mut Vec::new(), 4, &yes, |_| {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
     }
 }

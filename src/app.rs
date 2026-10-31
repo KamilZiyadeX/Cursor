@@ -1,6 +1,6 @@
 //! Masaüstü arayüzü (egui).
 
-use crate::net::{self, Net, NetEvent, NetOptions};
+use crate::net::{self, Net, NetEvent, NetOptions, format_bytes};
 use crate::protocol;
 use crate::storage::{Body, ChatMessage, Config, History, KnownPeer, MsgState};
 use chrono::{Local, TimeZone};
@@ -191,48 +191,88 @@ impl LanChatApp {
                 text,
             } => {
                 self.upsert_peer(&from.id, &from.name, addr);
-                self.push_message(ChatMessage {
-                    id: msg_id,
-                    peer_id: from.id.clone(),
-                    outgoing: false,
-                    ts: Local::now().timestamp(),
-                    body: Body::Text(text),
-                    state: MsgState::Done,
-                    progress: 0,
-                });
+                self.push_message(ChatMessage::new(
+                    msg_id,
+                    from.id.clone(),
+                    false,
+                    Body::Text(text),
+                    MsgState::Done,
+                ));
                 self.on_incoming(ctx, &from.id);
             }
-            NetEvent::IncomingFile {
+            NetEvent::IncomingTransfer {
                 from,
                 addr,
                 msg_id,
                 name,
-                size,
+                is_dir,
+                total_size,
+                file_count,
             } => {
                 self.upsert_peer(&from.id, &from.name, addr);
-                self.push_message(ChatMessage {
-                    id: msg_id,
-                    peer_id: from.id.clone(),
-                    outgoing: false,
-                    ts: Local::now().timestamp(),
-                    body: Body::File {
-                        name,
+                if let Some(m) = self.message_mut(&msg_id) {
+                    // Yarım kalan aktarım kaldığı yerden devam ediyor
+                    m.state = MsgState::Pending;
+                    m.progress = 0;
+                    m.speed.reset();
+                    if let Body::File {
                         size,
-                        path: None,
-                    },
-                    state: MsgState::Pending,
-                    progress: 0,
-                });
-                self.on_incoming(ctx, &from.id);
+                        file_count: c,
+                        ..
+                    } = &mut m.body
+                    {
+                        *size = total_size;
+                        *c = file_count;
+                    }
+                    self.dirty = true;
+                } else {
+                    self.push_message(ChatMessage::new(
+                        msg_id,
+                        from.id.clone(),
+                        false,
+                        Body::File {
+                            name,
+                            size: total_size,
+                            path: None,
+                            is_dir,
+                            file_count,
+                        },
+                        MsgState::Pending,
+                    ));
+                    self.on_incoming(ctx, &from.id);
+                }
+            }
+            NetEvent::Scanned {
+                msg_id,
+                total_size,
+                file_count,
+            } => {
+                if let Some(m) = self.message_mut(&msg_id)
+                    && let Body::File {
+                        size,
+                        file_count: c,
+                        ..
+                    } = &mut m.body
+                {
+                    *size = total_size;
+                    *c = file_count;
+                    self.dirty = true;
+                }
             }
             NetEvent::Progress { msg_id, done } => {
                 if let Some(m) = self.message_mut(&msg_id) {
                     m.progress = done;
+                    m.speed.update(done);
                 }
             }
-            NetEvent::Completed { msg_id, saved_path } => {
+            NetEvent::Completed {
+                msg_id,
+                saved_path,
+                note,
+            } => {
                 if let Some(m) = self.message_mut(&msg_id) {
                     m.state = MsgState::Done;
+                    m.note = note;
                     if let (Some(p), Body::File { path, .. }) = (saved_path, &mut m.body) {
                         *path = Some(p);
                     }
@@ -298,54 +338,53 @@ impl LanChatApp {
             return;
         };
         let id = new_id();
-        self.push_message(ChatMessage {
-            id: id.clone(),
+        self.push_message(ChatMessage::new(
+            id.clone(),
             peer_id,
-            outgoing: true,
-            ts: Local::now().timestamp(),
-            body: Body::Text(text.clone()),
-            state: MsgState::Pending,
-            progress: 0,
-        });
+            true,
+            Body::Text(text.clone()),
+            MsgState::Pending,
+        ));
         net.send_text(addr, id, text);
         self.input.clear();
     }
 
-    fn send_files(&mut self, paths: Vec<PathBuf>) {
+    /// Dosyaları ve/veya klasörleri gönderir.
+    fn send_paths(&mut self, paths: Vec<PathBuf>) {
         let Some(net) = self.net.clone() else { return };
         let Some((peer_id, addr)) = self.target_addr() else {
             return;
         };
         for path in paths {
             let Ok(meta) = std::fs::metadata(&path) else {
+                self.show_toast(format!("Okunamadı: {}", path.display()));
                 continue;
             };
-            if meta.is_dir() {
-                self.show_toast("Klasörler gönderilemez; lütfen önce ZIP yapın");
-                continue;
-            }
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .unwrap_or_else(|| path.display().to_string());
+            let is_dir = meta.is_dir();
             let id = new_id();
-            self.push_message(ChatMessage {
-                id: id.clone(),
-                peer_id: peer_id.clone(),
-                outgoing: true,
-                ts: Local::now().timestamp(),
-                body: Body::File {
+            self.push_message(ChatMessage::new(
+                id.clone(),
+                peer_id.clone(),
+                true,
+                Body::File {
                     name,
-                    size: meta.len(),
+                    // Klasörün boyutu tarama bitince belli olur
+                    size: if is_dir { 0 } else { meta.len() },
                     path: Some(path.clone()),
+                    is_dir,
+                    file_count: if is_dir { 0 } else { 1 },
                 },
-                state: MsgState::Pending,
-                progress: 0,
-            });
-            net.send_file(addr, id, path);
+                MsgState::Pending,
+            ));
+            net.send_path(addr, id, path);
         }
     }
 
+    /// Başarısız mesajı yeniden gönderir; dosya/klasörde kaldığı yerden devam eder.
     fn retry(&mut self, msg_id: &str) {
         let Some(net) = self.net.clone() else { return };
         let Some(m) = self.messages.iter().find(|m| m.id == msg_id).cloned() else {
@@ -358,10 +397,12 @@ impl LanChatApp {
         if let Some(mm) = self.message_mut(msg_id) {
             mm.state = MsgState::Pending;
             mm.progress = 0;
+            mm.note = None;
+            mm.speed.reset();
         }
         match m.body {
             Body::Text(t) => net.send_text(addr, m.id, t),
-            Body::File { path: Some(p), .. } => net.send_file(addr, m.id, p),
+            Body::File { path: Some(p), .. } => net.send_path(addr, m.id, p),
             Body::File { path: None, .. } => {}
         }
     }
@@ -490,18 +531,25 @@ impl LanChatApp {
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui
-                .add_sized(
-                    [36.0, 36.0],
-                    egui::Button::new(RichText::new("📎").size(18.0)),
-                )
-                .on_hover_text("Dosya gönder")
-                .clicked()
-                && let Some(files) = rfd::FileDialog::new()
-                    .set_title("Gönderilecek dosyaları seçin")
-                    .pick_files()
-            {
-                self.send_files(files);
+            let mut picked: Option<Vec<PathBuf>> = None;
+            ui.menu_button(RichText::new("📎").size(18.0), |ui| {
+                if ui.button("📄  Dosya gönder…").clicked() {
+                    ui.close();
+                    picked = rfd::FileDialog::new()
+                        .set_title("Gönderilecek dosyaları seçin")
+                        .pick_files();
+                }
+                if ui.button("🗂  Klasör gönder…").clicked() {
+                    ui.close();
+                    picked = rfd::FileDialog::new()
+                        .set_title("Gönderilecek klasörleri seçin")
+                        .pick_folders();
+                }
+            })
+            .response
+            .on_hover_text("Dosya ya da klasör gönder (pencereye sürükleyip de bırakabilirsiniz)");
+            if let Some(paths) = picked {
+                self.send_paths(paths);
             }
             let send_w = 80.0;
             let edit = TextEdit::multiline(&mut self.input)
@@ -590,6 +638,11 @@ impl LanChatApp {
         for a in actions {
             match a {
                 Action::Retry(id) => self.retry(&id),
+                Action::Cancel(id) => {
+                    if let Some(net) = &self.net {
+                        net.cancel(&id);
+                    }
+                }
                 Action::Copy(t) => {
                     ui.ctx().copy_text(t);
                     self.show_toast("Kopyalandı");
@@ -745,6 +798,7 @@ impl LanChatApp {
 
 enum Action {
     Retry(String),
+    Cancel(String),
     Copy(String),
 }
 
@@ -785,16 +839,16 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
                         Body::Text(t) => {
                             ui.add(egui::Label::new(RichText::new(t).size(15.0)).wrap());
                         }
-                        Body::File { name, size, path } => {
-                            file_body(ui, m, name, *size, path.as_deref())
-                        }
+                        Body::File { .. } => file_body(ui, m, actions),
                     }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format_time(m.ts)).small().weak());
                         if m.outgoing {
                             match &m.state {
                                 MsgState::Pending => {
-                                    ui.label(RichText::new("gönderiliyor…").small().weak());
+                                    if matches!(m.body, Body::Text(_)) {
+                                        ui.label(RichText::new("gönderiliyor…").small().weak());
+                                    }
                                 }
                                 MsgState::Done => {
                                     ui.label(
@@ -811,7 +865,12 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
                                             .color(Color32::from_rgb(220, 38, 38)),
                                     )
                                     .on_hover_text(e);
-                                    if ui.small_button("Tekrar dene").clicked() {
+                                    let label = if matches!(m.body, Body::Text(_)) {
+                                        "Tekrar dene"
+                                    } else {
+                                        "▶ Kaldığı yerden devam et"
+                                    };
+                                    if ui.small_button(label).clicked() {
                                         actions.push(Action::Retry(m.id.clone()));
                                     }
                                 }
@@ -823,6 +882,13 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
                                     .color(Color32::from_rgb(220, 38, 38)),
                             )
                             .on_hover_text(e);
+                        }
+                        if let Some(note) = &m.note {
+                            ui.label(
+                                RichText::new(format!("ⓘ {note}"))
+                                    .small()
+                                    .color(Color32::from_rgb(234, 88, 12)),
+                            );
                         }
                     });
                 });
@@ -846,42 +912,96 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
     });
 }
 
-fn file_body(ui: &mut egui::Ui, m: &ChatMessage, name: &str, size: u64, path: Option<&Path>) {
+fn file_body(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>) {
+    let Body::File {
+        name,
+        size,
+        path,
+        is_dir,
+        file_count,
+    } = &m.body
+    else {
+        return;
+    };
+    let (size, is_dir) = (*size, *is_dir);
+    let scanning =
+        is_dir && m.outgoing && size == 0 && *file_count == 0 && m.state == MsgState::Pending;
+
     ui.horizontal(|ui| {
-        ui.label(RichText::new(file_icon(name)).size(26.0));
+        ui.label(RichText::new(if is_dir { "🗂" } else { file_icon(name) }).size(26.0));
         ui.vertical(|ui| {
             ui.add(egui::Label::new(RichText::new(name).strong()).wrap());
-            ui.label(RichText::new(format_size(size)).small().weak());
+            let info = if scanning {
+                "klasör taranıyor…".to_string()
+            } else if is_dir {
+                format!(
+                    "{} dosya · {}",
+                    format_count(*file_count),
+                    format_bytes(size)
+                )
+            } else {
+                format_bytes(size)
+            };
+            ui.label(RichText::new(info).small().weak());
         });
     });
-    match (&m.state, path) {
-        (MsgState::Pending, _) => {
+
+    match &m.state {
+        MsgState::Pending => {
             let frac = if size == 0 {
-                1.0
+                if scanning { 0.0 } else { 1.0 }
             } else {
-                m.progress as f32 / size as f32
+                (m.progress as f64 / size as f64).min(1.0) as f32
             };
             ui.add(
                 egui::ProgressBar::new(frac)
-                    .desired_width(240.0)
+                    .desired_width(300.0)
                     .text(format!(
                         "{}  /  {}",
-                        format_size(m.progress),
-                        format_size(size)
+                        format_bytes(m.progress.min(size)),
+                        format_bytes(size)
                     )),
             );
-        }
-        (MsgState::Done, Some(p)) => {
             ui.horizontal(|ui| {
-                if !m.outgoing && ui.button("Aç").clicked() {
-                    open_path(p);
+                let bps = m.speed.bytes_per_sec;
+                if bps > 0.0 {
+                    let left = size.saturating_sub(m.progress) as f64 / bps;
+                    ui.label(
+                        RichText::new(format!(
+                            "{}/sn · kalan {}",
+                            format_bytes(bps as u64),
+                            format_eta(left)
+                        ))
+                        .small()
+                        .weak(),
+                    );
                 }
-                if ui.button("Klasörde göster").clicked() {
-                    reveal_path(p);
+                if ui.small_button("✖ İptal").clicked() {
+                    actions.push(Action::Cancel(m.id.clone()));
                 }
             });
         }
-        _ => {}
+        MsgState::Done => {
+            if let Some(p) = path {
+                ui.horizontal(|ui| {
+                    if !m.outgoing && ui.button("Aç").clicked() {
+                        open_path(p);
+                    }
+                    if ui.button("Klasörde göster").clicked() {
+                        reveal_path(p);
+                    }
+                });
+            }
+        }
+        MsgState::Failed(_) => {
+            if !m.outgoing {
+                ui.label(
+                    RichText::new("Gönderen “Kaldığı yerden devam et” derse aktarım sürer.")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
     }
 }
 
@@ -931,7 +1051,7 @@ impl eframe::App for LanChatApp {
                 .collect()
         });
         if !dropped.is_empty() {
-            self.send_files(dropped);
+            self.send_paths(dropped);
         }
 
         egui::Panel::top("top").show(ui, |ui| {
@@ -989,24 +1109,33 @@ fn parse_ip(s: &str) -> Option<IpAddr> {
     s.trim().parse().ok()
 }
 
-fn format_size(n: u64) -> String {
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
-    if n < 1024 {
-        return format!("{n} B");
+fn format_count(n: u64) -> String {
+    // 1234567 -> "1.234.567"
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(c);
     }
-    let mut v = n as f64;
-    let mut i = 0;
-    v /= 1024.0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
+    out
+}
+
+fn format_eta(secs: f64) -> String {
+    if !secs.is_finite() {
+        return "?".into();
     }
-    let s = if v < 10.0 {
-        format!("{v:.1}")
+    let s = secs.round() as u64;
+    if s < 60 {
+        format!("~{s} sn")
+    } else if s < 3600 {
+        format!("~{} dk", s.div_ceil(60))
+    } else if s < 48 * 3600 {
+        format!("~{} sa {} dk", s / 3600, (s % 3600) / 60)
     } else {
-        format!("{v:.0}")
-    };
-    format!("{} {}", s.replace('.', ","), UNITS[i])
+        format!("~{} gün {} sa", s / 86400, (s % 86400) / 3600)
+    }
 }
 
 fn format_time(ts: i64) -> String {
@@ -1088,10 +1217,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sizes() {
-        assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(1536), "1,5 KB");
-        assert_eq!(format_size(3 * 1024 * 1024), "3,0 MB");
-        assert_eq!(format_size(250 * 1024 * 1024 * 1024), "250 GB");
+    fn counts_and_eta() {
+        assert_eq!(format_count(7), "7");
+        assert_eq!(format_count(1234), "1.234");
+        assert_eq!(format_count(1234567), "1.234.567");
+        assert_eq!(format_eta(42.0), "~42 sn");
+        assert_eq!(format_eta(61.0), "~2 dk");
+        assert_eq!(format_eta(3.0 * 3600.0 + 120.0), "~3 sa 2 dk");
+        assert_eq!(format_eta(f64::INFINITY), "?");
     }
 }

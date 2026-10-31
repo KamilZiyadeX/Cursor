@@ -5,7 +5,9 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 - Sunucu, hesap ya da internet bağlantısı gerekmez: her şey yerel ağın içinde kalır.
 - Aynı ağdaki LanChat'ler birbirini **otomatik bulur**, birkaç saniye içinde kişi listesinde görünür.
 - **Mesajlar**: Enter gönderir, Shift+Enter yeni satır ekler. Mesaja sağ tıklayıp kopyalayabilirsiniz.
-- **Dosyalar**: 📎 düğmesiyle seçin ya da dosyaları pencereye sürükleyip bırakın. Boyut sınırı yoktur; ilerleme çubuğu gösterilir.
+- **Dosya ve klasörler**: 📎 → *Dosya gönder* / *Klasör gönder* ile seçin ya da pencereye sürükleyip bırakın. **Boyut ve dosya sayısı sınırı yoktur** (1 TB'lık bir klasör de gönderilebilir). Klasörler alt klasörleri, boş klasörleri ve dosyaların değiştirilme tarihleriyle birlikte aynen kopyalanır.
+- **Kaldığı yerden devam**: Bağlantı koparsa, bilgisayar kapanırsa ya da **✖ İptal**'e basılırsa yarım kalan kısım silinmez. Gönderen **▶ Kaldığı yerden devam et** dediğinde tamamlanan dosyalar atlanır, yarım kalan dosya kaldığı bayttan sürer.
+- Aktarım sırasında **hız** ve **kalan süre** gösterilir. Alıcıda yeterli boş alan yoksa aktarım başlamadan reddedilir.
 - Gelen dosyalar `İndirilenler/LanChat` klasörüne kaydedilir (Ayarlar'dan değiştirilebilir). Her dosyanın yanında **Aç** ve **Klasörde göster** düğmeleri vardır.
 - Okunmamış mesaj sayısı ve görev çubuğunda yanıp sönme ile bildirim.
 - Sohbet geçmişi saklanır; uygulama kapatılıp açılınca kaybolmaz.
@@ -20,6 +22,21 @@ Aynı internet ağına (aynı modem / Wi‑Fi) bağlı bilgisayarlar arasında *
 ### Windows güvenlik duvarı
 
 İlk açılışta Windows “Bu uygulamaya ağ erişimi izni verilsin mi?” diye sorar. **Özel ağlar** kutusunu işaretleyip **İzin ver** deyin. Bu adım atlanırsa diğer bilgisayar sizi göremez ya da size gönderemez.
+
+### Çok büyük aktarımlar (yüzlerce GB / TB)
+
+Süreyi belirleyen şey ağ hızıdır. Yaklaşık değerler (1 TB için):
+
+| Bağlantı                         | Gerçek hız       | 1 TB süresi   |
+|----------------------------------|------------------|---------------|
+| Kablolu, 1 Gbit (iki taraf da)   | ~110 MB/sn       | ~2,5–3 saat   |
+| Kablolu, 2,5 Gbit                | ~280 MB/sn       | ~1 saat       |
+| Wi‑Fi 6, iyi çekim               | ~50–90 MB/sn     | ~3–6 saat     |
+| Wi‑Fi 5 / zayıf çekim            | ~10–40 MB/sn     | ~7–29 saat    |
+
+İpuçları: Mümkünse iki bilgisayarı da kabloyla bağlayın; aktarım sürerken bilgisayarların uyku moduna geçmesini kapatın. Kesinti olursa **▶ Kaldığı yerden devam et** yeterlidir.
+
+Yarım kalan aktarımlar indirme klasöründe `.lanchat-…` adıyla tutulur; 30 gün boyunca devam ettirilmeyenler açılışta otomatik silinir.
 
 ### Karşı bilgisayar listede görünmüyorsa
 
@@ -67,8 +84,8 @@ cargo test
 ## Nasıl çalışır?
 
 - **Keşif**: Her uygulama 3 saniyede bir UDP 47820 portuna kimliğini, adını ve TCP portunu yayınlar. Bir duyuru aldığında karşı tarafa doğrudan (unicast) de duyuru gönderir; böylece yayın tek yönlü ulaşsa bile iki taraf birbirini görür. 10 saniyedir duyuru gelmeyen kişi çevrimdışı görünür.
-- **Aktarım**: Her mesaj veya dosya için karşı tarafın TCP portuna (varsayılan 47821) yeni bir bağlantı açılır. Gönderen önce küçük bir JSON başlığı, dosyaysa ardından dosya baytlarını yollar. Alıcı her şeyi diske yazdıktan sonra bir onay baytı döner; gönderen tarafta ✔ işareti bu onayla görünür.
-- Gelen dosya önce geçici `.lanchat-….part` adıyla yazılır, tamamlanınca asıl adına taşınır. Aynı adda dosya varsa `ad (1).uzantı` şeklinde kaydedilir. Dosya adındaki klasör kısımları atılır; gönderen, indirme klasörünün dışına dosya yazamaz.
+- **Aktarım**: Her mesaj veya dosya/klasör için karşı tarafın TCP portuna (varsayılan 47821) yeni bir bağlantı açılır. Gönderen önce aktarımın adını, toplam boyutunu ve dosya sayısını bildirir; alıcı boş alanı kontrol edip kabul eder. Ardından her klasör ve dosya sırayla gönderilir. Her dosya için alıcı, o dosyanın elinde zaten ne kadarı olduğunu söyler ve gönderen yalnızca kalanını yollar; kaldığı yerden devam etme böyle çalışır. Sonunda alıcı bir onay baytı döner; gönderen tarafta ✔ işareti bu onayla görünür.
+- Gelen veri önce geçici `.lanchat-….part` (klasörde `.partdir`) adıyla yazılır, tamamlanınca asıl adına taşınır. Aynı adda dosya/klasör varsa `ad (1)` şeklinde kaydedilir. `..` içeren yollar reddedilir; gönderen, indirme klasörünün dışına dosya yazamaz. Gönderen taraftaki sembolik bağlantılar izlenmez; okunamayan dosyalar atlanır ve kaç tane atlandığı mesajda yazılır.
 
 Kaynak kod düzeni:
 

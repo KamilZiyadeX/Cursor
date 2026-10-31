@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
@@ -18,10 +19,17 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Body {
     Text(String),
+    /// Dosya ya da klasör aktarımı
     File {
         name: String,
+        /// Toplam bayt (klasörde tüm dosyaların toplamı)
         size: u64,
+        /// Gönderende kaynak, alıcıda kaydedildiği yol
         path: Option<PathBuf>,
+        #[serde(default)]
+        is_dir: bool,
+        #[serde(default)]
+        file_count: u64,
     },
 }
 
@@ -41,9 +49,62 @@ pub struct ChatMessage {
     pub ts: i64,
     pub body: Body,
     pub state: MsgState,
+    /// Ek bilgi (ör. atlanan dosyalar)
+    #[serde(default)]
+    pub note: Option<String>,
     /// Aktarılan bayt (yalnızca aktarım sürerken anlamlı)
     #[serde(skip)]
     pub progress: u64,
+    #[serde(skip)]
+    pub speed: Speed,
+}
+
+impl ChatMessage {
+    pub fn new(id: String, peer_id: String, outgoing: bool, body: Body, state: MsgState) -> Self {
+        Self {
+            id,
+            peer_id,
+            outgoing,
+            ts: chrono::Local::now().timestamp(),
+            body,
+            state,
+            note: None,
+            progress: 0,
+            speed: Speed::default(),
+        }
+    }
+}
+
+/// Aktarım hızının (bayt/sn) yumuşatılmış ölçümü.
+#[derive(Clone, Debug, Default)]
+pub struct Speed {
+    pub bytes_per_sec: f64,
+    sample: Option<(Instant, u64)>,
+}
+
+impl Speed {
+    pub fn update(&mut self, done: u64) {
+        let now = Instant::now();
+        match self.sample {
+            None => self.sample = Some((now, done)),
+            Some((t0, b0)) => {
+                let dt = now.duration_since(t0).as_secs_f64();
+                if dt >= 1.0 {
+                    let inst = done.saturating_sub(b0) as f64 / dt;
+                    self.bytes_per_sec = if self.bytes_per_sec == 0.0 {
+                        inst
+                    } else {
+                        0.7 * self.bytes_per_sec + 0.3 * inst
+                    };
+                    self.sample = Some((now, done));
+                }
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Speed::default();
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -134,7 +195,11 @@ impl History {
         // Uygulama kapanırken yarım kalan aktarımlar
         for m in &mut h.messages {
             if m.state == MsgState::Pending {
-                m.state = MsgState::Failed("Aktarım yarıda kaldı".into());
+                m.state = MsgState::Failed(if m.outgoing {
+                    "Aktarım yarıda kaldı".into()
+                } else {
+                    "Aktarım yarıda kaldı; gönderen “Devam et” derse kaldığı yerden sürer".into()
+                });
             }
         }
         h
@@ -159,17 +224,20 @@ mod tests {
                 addr: Some("192.168.1.5:47821".parse().unwrap()),
             }],
             messages: vec![ChatMessage {
-                id: "1".into(),
-                peer_id: "p".into(),
-                outgoing: true,
-                ts: 0,
-                body: Body::File {
-                    name: "a.zip".into(),
-                    size: 10,
-                    path: None,
-                },
-                state: MsgState::Pending,
                 progress: 5,
+                ..ChatMessage::new(
+                    "1".into(),
+                    "p".into(),
+                    true,
+                    Body::File {
+                        name: "a.zip".into(),
+                        size: 10,
+                        path: None,
+                        is_dir: false,
+                        file_count: 1,
+                    },
+                    MsgState::Pending,
+                )
             }],
         };
         h.save(&dir).unwrap();
