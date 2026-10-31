@@ -495,6 +495,12 @@ impl eframe::App for Root {
         }
     }
 
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(chat) = &mut self.chat {
+            chat.raw_input_hook(ctx, raw_input);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if let Some(chat) = &mut self.chat {
             chat.ui(ui, frame);

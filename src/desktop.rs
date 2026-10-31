@@ -24,6 +24,39 @@ pub enum SoundKind {
     Windows,
 }
 
+/// Dosyalar sohbetten dışarı (masaüstüne, klasöre) sürüklenebilir mi?
+pub const HAS_DRAG_OUT: bool = cfg!(windows);
+
+/// Dosyayı pencereden dışarı sürüklemeyi başlatır (Windows). Sürükleme bitene
+/// kadar bekler; bırakıldıysa `true` döner.
+#[cfg(windows)]
+pub fn drag_out(window: &impl raw_window_handle::HasWindowHandle, path: &std::path::Path) -> bool {
+    use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = dropped.clone();
+    let res = drag::start_drag(
+        window,
+        drag::DragItem::Files(vec![path.to_path_buf()]),
+        drag::Image::Raw(include_bytes!("../assets/icon/lanchat-48.png").to_vec()),
+        move |result, _| {
+            flag.store(
+                matches!(result, drag::DragResult::Dropped),
+                Ordering::Relaxed,
+            );
+        },
+        drag::Options::default(),
+    );
+    res.is_ok() && dropped.load(Ordering::Relaxed)
+}
+
+#[cfg(not(windows))]
+pub fn drag_out(
+    _window: &impl raw_window_handle::HasWindowHandle,
+    _path: &std::path::Path,
+) -> bool {
+    false
+}
+
 /// Bu platformda sistem tepsisi var mı?
 pub const HAS_TRAY: bool = cfg!(windows);
 

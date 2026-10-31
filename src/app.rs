@@ -164,6 +164,10 @@ pub struct LanChatApp {
     paste_preview: Option<(String, egui::ColorImage, egui::TextureHandle)>,
     /// Dosya Gezgini'nden "Gönder → LanChat" ile gelen, kime gideceği sorulan dosyalar
     send_choice: Option<Vec<PathBuf>>,
+    /// Pencereden dışarı sürüklenecek dosya (bu karenin sonunda başlatılır)
+    drag_out: Option<PathBuf>,
+    /// Dışarı sürükleme bitti: egui fare bırakılmasını görmediği için bildirilecek
+    release_pointer: bool,
     /// Açık arama: (hangi sohbette, aranan metin)
     search: Option<(String, String)>,
     /// Arama kutusuna odaklanılsın mı (bir kerelik)
@@ -299,6 +303,8 @@ impl LanChatApp {
             last_queue_check: Instant::now(),
             paste_preview: None,
             send_choice: None,
+            drag_out: None,
+            release_pointer: false,
             search: None,
             search_focus: false,
             thumbs: HashMap::new(),
@@ -2793,6 +2799,7 @@ impl LanChatApp {
         for a in actions {
             match a {
                 Action::OpenFile(p) => open_path(&p),
+                Action::DragOut(p) => self.drag_out = Some(p),
                 Action::Retry(id) => self.retry(&id),
                 Action::Cancel(id) => {
                     if let Some(net) = &self.net {
@@ -3190,6 +3197,8 @@ impl LanChatApp {
 
 enum Action {
     OpenFile(PathBuf),
+    /// Dosyayı pencereden dışarı sürükle
+    DragOut(PathBuf),
     Retry(String),
     Cancel(String),
     Copy(String),
@@ -3553,7 +3562,7 @@ fn file_body(
     let scanning =
         is_dir && m.outgoing && size == 0 && *file_count == 0 && m.state == MsgState::Pending;
 
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.label(RichText::new(if is_dir { "🗂" } else { file_icon(name) }).size(26.0));
         ui.vertical(|ui| {
             ui.add(egui::Label::new(RichText::new(name).strong()).wrap());
@@ -3571,6 +3580,24 @@ fn file_body(
             ui.label(RichText::new(info).small().weak());
         });
     });
+    // Teslim edilmiş dosya, satırından tutulup masaüstüne/klasöre sürüklenebilir
+    if desktop::HAS_DRAG_OUT
+        && m.state == MsgState::Done
+        && let Some(p) = path
+        && p.exists()
+    {
+        let drag = ui
+            .interact(
+                row.response.rect,
+                Id::unique(("dosya-surukle", m.id.as_str())),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text("Masaüstüne ya da bir klasöre sürükleyip bırakabilirsiniz");
+        if drag.drag_started() {
+            actions.push(Action::DragOut(p.clone()));
+        }
+    }
 
     match &m.state {
         MsgState::Queued => {
@@ -3703,7 +3730,30 @@ impl eframe::App for LanChatApp {
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Windows'un sürükle-bırak döngüsü fare bırakma olayını yuttuğu için
+        // egui düğmeyi hâlâ basılı sanmasın
+        if std::mem::take(&mut self.release_pointer) {
+            let pos = raw_input
+                .events
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    egui::Event::PointerMoved(p) => Some(*p),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            raw_input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            });
+            raw_input.events.push(egui::Event::PointerGone);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -3760,6 +3810,12 @@ impl eframe::App for LanChatApp {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(ui.visuals().extreme_bg_color))
             .show(ui, |ui| self.chat(ui));
+
+        if let Some(path) = self.drag_out.take() {
+            desktop::drag_out(frame, &path);
+            self.release_pointer = true;
+            ctx.request_repaint();
+        }
 
         self.settings_window(&ctx);
         self.new_account_window(&ctx);
