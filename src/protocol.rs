@@ -86,6 +86,10 @@ pub enum Packet {
     },
     /// Eşleştirme isteği; alıcıda iki tarafın anahtarlarından türetilen kod gösterilir.
     PairRequest { from: From },
+    /// Karşı taraf yazıyor (yanıt beklenmez)
+    Typing { from: From },
+    /// Bu mesajlar okundu (yanıt beklenmez)
+    Read { from: From, msg_ids: Vec<String> },
     /// Tek dosya (`is_dir == false`) ya da klasör aktarımı.
     Transfer {
         from: From,

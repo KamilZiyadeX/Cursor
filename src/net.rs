@@ -68,6 +68,15 @@ pub enum NetEvent {
     Notice {
         text: String,
     },
+    /// Karşı taraf şu an yazıyor
+    Typing {
+        peer_id: String,
+    },
+    /// Karşı taraf bu mesajlarımızı okudu
+    Read {
+        peer_id: String,
+        msg_ids: Vec<String>,
+    },
     IncomingText {
         from: protocol::From,
         addr: SocketAddr,
@@ -565,6 +574,19 @@ impl Net {
                     },
                 );
             }
+            Packet::Typing { from } => {
+                if self.is_authorized(&from.id, &remote) {
+                    self.emit(NetEvent::Typing { peer_id: from.id });
+                }
+            }
+            Packet::Read { from, msg_ids } => {
+                if self.is_authorized(&from.id, &remote) {
+                    self.emit(NetEvent::Read {
+                        peer_id: from.id,
+                        msg_ids,
+                    });
+                }
+            }
             Packet::Text { from, msg_id, text } => {
                 if from.id == self.inner.my_id {
                     return;
@@ -812,6 +834,32 @@ impl Net {
                     },
                 },
             });
+        });
+    }
+
+    /// Karşıya "yazıyor" bildirir (sonucu beklenmez, hata yok sayılır).
+    pub fn send_typing(&self, addr: SocketAddr, peer_id: String) {
+        let packet = Packet::Typing { from: self.me() };
+        self.send_signal(addr, peer_id, packet);
+    }
+
+    /// Karşıya mesajlarının okunduğunu bildirir.
+    pub fn send_read(&self, addr: SocketAddr, peer_id: String, msg_ids: Vec<String>) {
+        let packet = Packet::Read {
+            from: self.me(),
+            msg_ids,
+        };
+        self.send_signal(addr, peer_id, packet);
+    }
+
+    fn send_signal(&self, addr: SocketAddr, peer_id: String, packet: Packet) {
+        let net = self.clone();
+        thread::spawn(move || {
+            let _ = (|| -> io::Result<()> {
+                let mut s = net.secure_connect(addr, Some(&peer_id))?;
+                protocol::write_frame(&mut s, &packet)?;
+                s.flush()
+            })();
         });
     }
 
@@ -1563,6 +1611,40 @@ mod tests {
             unreachable!()
         };
         assert!(!accepted);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn typing_and_read_reach_only_paired_peers() {
+        let d = temp_dir("tr");
+        let (a, _rx_a) = start("A", &d);
+        let (b, rx_b) = start("B", &d);
+        let addr_b: SocketAddr = ([127, 0, 0, 1], b.tcp_port()).into();
+
+        // Eşleşmemişken: B hiçbir şey görmemeli
+        a.set_trusted(HashMap::from([("B".to_string(), b.public_key())]));
+        a.send_typing(addr_b, "B".into());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            rx_b.try_iter()
+                .all(|e| !matches!(e, NetEvent::Typing { .. }))
+        );
+
+        // Eşleşince ulaşır
+        pair_up(&a, "A", &b, "B");
+        a.send_typing(addr_b, "B".into());
+        wait_for(
+            &rx_b,
+            |e| matches!(e, NetEvent::Typing { peer_id } if peer_id == "A"),
+        );
+        a.send_read(addr_b, "B".into(), vec!["m1".into(), "m2".into()]);
+        let NetEvent::Read { peer_id, msg_ids } =
+            wait_for(&rx_b, |e| matches!(e, NetEvent::Read { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(peer_id, "A");
+        assert_eq!(msg_ids, vec!["m1".to_string(), "m2".to_string()]);
         fs::remove_dir_all(d).unwrap();
     }
 

@@ -66,6 +66,12 @@ pub struct ChatMessage {
     /// Ek bilgi (ör. atlanan dosyalar)
     #[serde(default)]
     pub note: Option<String>,
+    /// Gönderdiğimiz mesajı karşı taraf okudu mu?
+    #[serde(default)]
+    pub read: bool,
+    /// Gelen mesaj için "okundu" bilgisini gönderdik mi?
+    #[serde(default)]
+    pub read_sent: bool,
     /// Aktarılan bayt (yalnızca aktarım sürerken anlamlı)
     #[serde(skip)]
     pub progress: u64,
@@ -83,6 +89,8 @@ impl ChatMessage {
             body,
             state,
             note: None,
+            read: false,
+            read_sent: false,
             progress: 0,
             speed: Speed::default(),
         }

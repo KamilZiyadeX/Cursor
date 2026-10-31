@@ -94,6 +94,10 @@ pub struct LanChatApp {
     profile: Profile,
     logo: egui::TextureHandle,
     new_account: Option<NewAccount>,
+    /// Kim ne zamana kadar "yazıyor" görünecek
+    typing: HashMap<String, Instant>,
+    /// En son "yazıyor" bildirimini ne zaman gönderdik
+    last_typing_sent: Option<Instant>,
     out_pair: Option<OutPair>,
     in_pair: Option<InPair>,
     net: Option<Net>,
@@ -167,6 +171,8 @@ impl LanChatApp {
             profile,
             logo,
             new_account: None,
+            typing: HashMap::new(),
+            last_typing_sent: None,
             out_pair: None,
             in_pair: None,
             net,
@@ -316,6 +322,18 @@ impl LanChatApp {
                 }
             }
             NetEvent::Notice { text } => self.show_toast(text),
+            NetEvent::Typing { peer_id } => {
+                self.typing
+                    .insert(peer_id, Instant::now() + Duration::from_secs(5));
+            }
+            NetEvent::Read { peer_id, msg_ids } => {
+                for m in self.messages.iter_mut() {
+                    if m.outgoing && m.peer_id == peer_id && !m.read && msg_ids.contains(&m.id) {
+                        m.read = true;
+                        self.dirty = true;
+                    }
+                }
+            }
             NetEvent::IncomingText {
                 from,
                 addr,
@@ -323,6 +341,7 @@ impl LanChatApp {
                 text,
             } => {
                 self.upsert_peer(&from.id, &from.name, addr, None);
+                self.typing.remove(&from.id);
                 self.push_message(ChatMessage::new(
                     msg_id,
                     from.id.clone(),
@@ -488,6 +507,57 @@ impl LanChatApp {
             self.show_toast(format!(
                 "🔒 “{name}” ile eşleşildi; artık konuşmalarınız şifreli"
             ));
+        }
+    }
+
+    /// Yazarken karşı tarafa en fazla 3 saniyede bir "yazıyor" bildirir.
+    fn notify_typing(&mut self) {
+        if self
+            .last_typing_sent
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        let Some(peer_id) = self.selected.clone() else {
+            return;
+        };
+        if !self.is_paired(&peer_id) {
+            return;
+        }
+        if let (Some(net), Some(addr)) = (&self.net, self.peer(&peer_id).and_then(|p| p.addr)) {
+            net.send_typing(addr, peer_id);
+            self.last_typing_sent = Some(Instant::now());
+        }
+    }
+
+    /// Pencere öndeyken açık sohbetteki yeni gelen mesajlar için "okundu" gönderir.
+    fn send_read_receipts(&mut self) {
+        if !self.focused {
+            return;
+        }
+        let Some(peer_id) = self.selected.clone() else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .messages
+            .iter()
+            .filter(|m| !m.outgoing && !m.read_sent && m.peer_id == peer_id)
+            .map(|m| m.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for m in self.messages.iter_mut() {
+            if !m.outgoing && m.peer_id == peer_id {
+                m.read_sent = true;
+            }
+        }
+        self.dirty = true;
+        if !self.is_paired(&peer_id) {
+            return;
+        }
+        if let (Some(net), Some(addr)) = (&self.net, self.peer(&peer_id).and_then(|p| p.addr)) {
+            net.send_read(addr, peer_id, ids);
         }
     }
 
@@ -993,7 +1063,9 @@ impl LanChatApp {
                 .desired_rows(2)
                 .desired_width(ui.available_width() - send_w - 8.0)
                 .hint_text("Mesaj yazın…  (Enter: gönder, Shift+Enter: yeni satır)");
-            ui.add(edit);
+            if ui.add(edit).changed() && !self.input.trim().is_empty() {
+                self.notify_typing();
+            }
             let send = ui.add_sized(
                 [send_w, 36.0],
                 egui::Button::new(RichText::new("Gönder ➤").strong()),
@@ -1036,6 +1108,13 @@ impl LanChatApp {
                     ("çevrimdışı", Color32::GRAY)
                 };
                 ui.label(RichText::new(txt).color(col).small());
+                if self
+                    .typing
+                    .get(&peer_id)
+                    .is_some_and(|t| *t > Instant::now())
+                {
+                    ui.label(RichText::new("yazıyor…").italics().small().weak());
+                }
                 if paired {
                     let hover = if local {
                         "Bu bilgisayardaki diğer hesabınız; mesajlar ve dosyalar şifreli gider"
@@ -1475,6 +1554,14 @@ fn message_bubble(ui: &mut egui::Ui, m: &ChatMessage, actions: &mut Vec<Action>)
                                         ui.label(RichText::new("gönderiliyor…").small().weak());
                                     }
                                 }
+                                MsgState::Done if m.read => {
+                                    ui.label(
+                                        RichText::new("✔✔")
+                                            .small()
+                                            .color(Color32::from_rgb(56, 189, 248)),
+                                    )
+                                    .on_hover_text("Okundu");
+                                }
                                 MsgState::Done => {
                                     ui.label(
                                         RichText::new("✔")
@@ -1658,6 +1745,7 @@ impl eframe::App for LanChatApp {
             self.title = title;
         }
 
+        self.send_read_receipts();
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             self.save_history();
         }
